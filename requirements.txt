@@ -1,0 +1,10 @@
+babel==2.18.0
+certifi==2026.10.23
+geopy==2.5.0
+hijri-converter==2.3.2.post1
+ntplib==0.4.0
+pycountry==26.2.16
+python-dotenv==1.2.4
+requests==2.34.2
+rich==15.0.0
+tzdata==2026.5

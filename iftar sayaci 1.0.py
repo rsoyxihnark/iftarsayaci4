@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 import concurrent.futures
 
+APP_VERSION = "1.0.0"
+
 class StreamToLogger(io.TextIOBase):
     def __init__(self, logger, level):
         self.logger = logger
@@ -858,7 +860,7 @@ class IftarModel:
         destination_handlers = [file_handler]
         rich_formatter = None
         try:
-            rich_console = ModuleManager.dynamic_import("rich.console").Console(file=original_stdout, force_terminal=True, color_system="auto")
+            rich_console = ModuleManager.dynamic_import("rich.console").Console(file=original_stdout or io.StringIO(), force_terminal=True, color_system="auto")
             rich_handler = rich_logging.RichHandler(
                 level=logging.INFO,
                 show_time=False,
@@ -1551,7 +1553,7 @@ class IftarController:
             "Konum - ipinfo.io",
             "Sistem Saati - pool.ntp.org"
         ]
-        about_text = "Yüklü kütüphaneler ve sürümleri:\n" + "\n".join(about_lines)
+        about_text = f"Sürüm: {APP_VERSION}\n\nYüklü kütüphaneler ve sürümleri:\n" + "\n".join(about_lines)
         about_text += "\n\nAPI Alan Adresleri:\n" + "\n".join(apiler)
         if self.view:
             self.view.show_info(about_text)
@@ -1695,7 +1697,7 @@ class IftarView:
                         city = parts[0].strip()
                         country = parts[-1].strip()
                 flag = get_country_flag(country) if country else ""
-                active_text = f"{city} {flag} — {self.model.current_latitude:.2f}° , {self.model.current_longitude:.2f}°"
+                active_text = f"{city} {flag}: {self.model.current_latitude:.2f}° , {self.model.current_longitude:.2f}°"
             else:
                 active_text = "Konum bilgisi yok"
             TkManager.safe_after(0, lambda: self._update_dynamic_entry(active_text))
@@ -1928,7 +1930,7 @@ class IftarView:
             gecen = (now - bir_onceki).total_seconds()
             yuzde = (gecen / toplam) * 100
             self.sayac_label.config(text=f"Sahura Kalan Süre: {kalan_str}")
-            self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {free_str} — %{yuzde:.4f} tamamlandı")
+            self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {free_str}, %{yuzde:.4f} tamamlandı")
             self.yuzde_cubugu["value"] = yuzde
         elif now < iftar_time:
             kalan = iftar_time - now
@@ -1937,7 +1939,7 @@ class IftarView:
             gecen = (now - imsak_time).total_seconds()
             yuzde = (gecen / toplam) * 100
             self.sayac_label.config(text=f"İftara Kalan Süre: {kalan_str}")
-            self.yuzde_etiket.config(text=f"Oruç süresi: {fasting_duration_str} — %{yuzde:.4f} tamamlandı")
+            self.yuzde_etiket.config(text=f"Oruç süresi: {fasting_duration_str}, %{yuzde:.4f} tamamlandı")
             self.yuzde_cubugu["value"] = yuzde
         else:
             next_imsak = imsak_time + timedelta(days=1)
@@ -1949,7 +1951,7 @@ class IftarView:
             gecen = (now - imsak_time).total_seconds() - (iftar_time - imsak_time).total_seconds()
             yuzde = (gecen / toplam) * 100
             self.sayac_label.config(text=f"Sahura Kalan Süre: {kalan_str}")
-            self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {free_str} — %{yuzde:.4f} tamamlandı")
+            self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {free_str}, %{yuzde:.4f} tamamlandı")
             self.yuzde_cubugu["value"] = yuzde
         TkManager.safe_after(1000, self.update_countdown, run_in_thread=False, context="UpdateCountdown-Tick")
 
@@ -2002,8 +2004,7 @@ class IftarView:
                 pencere_boyutu = f"{width_str}x{new_height}"
         local_now = get_utc_now().astimezone()
         baslik_text = ("Hoş geldin, Ramazan " + str(local_now.year) + "♥" if self.model.ramazan_mi() else "Namaz Vakitleri")
-        dosya_adi = os.path.basename(__file__)
-        self.pencere.title(f"{baslik_text} - {dosya_adi}")
+        self.pencere.title(f"{baslik_text} - İftar Sayacı {APP_VERSION}")
         self.pencere.geometry(pencere_boyutu)
         self.pencere.update_idletasks()
         TkManager.safe_after(100, self.controller.finalize_system_check, context="FinalizeSystemCheck")

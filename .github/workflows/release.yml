@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller==6.22.3
+
+      - name: Check the commit
+        id: gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = Get-Content -Raw -Encoding UTF8 "iftar sayaci 1.0.py"
+          $match = [regex]::Match($source, '(?m)^APP_VERSION = "(\d+\.\d+\.\d+)"\r?$')
+          if (-not $match.Success) { throw "APP_VERSION is missing from the source." }
+          $version = $match.Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+          $subject = git log -1 --pretty=%s
+          $files = @(git diff-tree --no-commit-id --name-only -r --root HEAD)
+          $programChanged = $files -contains "iftar sayaci 1.0.py"
+          $changelogChanged = $files -contains "CHANGELOG.md"
+
+          if ($subject -match '^\[no release\]') {
+            if ($programChanged) { throw "A commit that changes the program must carry a version." }
+            "release=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $subjectMatch = [regex]::Match($subject, '^\[(\d+\.\d+\.\d+)\]')
+          if (-not $subjectMatch.Success) { throw "The commit subject must start with [x.y.z] or [no release]." }
+          if ($subjectMatch.Groups[1].Value -ne $version) { throw "The commit subject version and APP_VERSION disagree." }
+          if (-not $programChanged) { throw "A version commit must change the program." }
+          if (-not $changelogChanged) { throw "A version commit must update CHANGELOG.md." }
+          $changelog = Get-Content -Raw -Encoding UTF8 "CHANGELOG.md"
+          if ($changelog -notmatch "(?m)^## \[$([regex]::Escape($version))\]\r?$") { throw "CHANGELOG.md has no section for $version." }
+          if (git ls-remote --exit-code --tags origin "refs/tags/$version" 2>$null) { throw "Version $version has already been published." }
+          "release=true" >> $env:GITHUB_OUTPUT
+          git log -1 --pretty=%b | Out-File -Encoding utf8 release-notes.md
+
+      - name: Check the text rules
+        shell: python
+        run: |
+          import subprocess
+          import tokenize
+          from pathlib import Path
+
+          failures = []
+          listing = subprocess.run(["git", "ls-files"], capture_output=True, text=True, encoding="utf-8").stdout
+          for name in listing.splitlines():
+              try:
+                  text = Path(name).read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              for number, line in enumerate(text.splitlines(), 1):
+                  if "\u2013" in line or "\u2014" in line:
+                      failures.append(f"{name}:{number}: has a dash that is not allowed")
+
+          for number, line in enumerate(Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines(), 1):
+              if len(line) > 248:
+                  failures.append(f"CHANGELOG.md:{number}: text longer than 248 characters")
+
+          with open("iftar sayaci 1.0.py", "rb") as handle:
+              for token in tokenize.tokenize(handle.readline):
+                  if token.type in (tokenize.COMMENT, tokenize.STRING) and len(token.string) > 248:
+                      failures.append(f"iftar sayaci 1.0.py:{token.start[0]}: text longer than 248 characters")
+
+          body = subprocess.run(["git", "log", "-1", "--pretty=%b"], capture_output=True, text=True, encoding="utf-8").stdout
+          for number, line in enumerate(body.splitlines(), 1):
+              if len(line) > 248:
+                  failures.append(f"commit body:{number}: text longer than 248 characters")
+
+          if failures:
+              print("\n".join(failures))
+              raise SystemExit(1)
+
+      - name: Write the version resource
+        shell: python
+        env:
+          APP_VERSION: ${{ steps.gate.outputs.version }}
+        run: |
+          import os
+          from pathlib import Path
+
+          version = os.environ["APP_VERSION"]
+          parts = [int(part) for part in version.split(".")]
+          text = f"""VSVersionInfo(
+            ffi=FixedFileInfo(
+              filevers=({parts[0]}, {parts[1]}, {parts[2]}, 0),
+              prodvers=({parts[0]}, {parts[1]}, {parts[2]}, 0),
+              mask=0x3f,
+              flags=0x0,
+              OS=0x40004,
+              fileType=0x1,
+              subtype=0x0,
+              date=(0, 0)
+            ),
+            kids=[
+              StringFileInfo(
+                [
+                  StringTable(
+                    u'040904B0',
+                    [
+                      StringStruct(u'CompanyName', u'rsoyxihnark'),
+                      StringStruct(u'FileDescription', u'Iftar Sayaci'),
+                      StringStruct(u'FileVersion', u'{version}'),
+                      StringStruct(u'InternalName', u'IftarSayaci'),
+                      StringStruct(u'OriginalFilename', u'IftarSayaci.exe'),
+                      StringStruct(u'ProductName', u'Iftar Sayaci'),
+                      StringStruct(u'ProductVersion', u'{version}')
+                    ]
+                  )
+                ]
+              ),
+              VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+            ]
+          )
+          """
+          Path("version_info.txt").write_text(text, encoding="utf-8")
+
+      - name: Build the exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $versionFile = Join-Path (Get-Location) "version_info.txt"
+          $pyArgs = @(
+            "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
+            "--name", "IftarSayaci",
+            "--version-file", $versionFile,
+            "--distpath", "dist", "--workpath", "build", "--specpath", "build",
+            "--hidden-import", "ast", "--hidden-import", "asyncio", "--hidden-import", "babel.dates",
+            "--hidden-import", "collections", "--hidden-import", "concurrent.futures", "--hidden-import", "configparser",
+            "--hidden-import", "difflib", "--hidden-import", "hashlib", "--hidden-import", "locale",
+            "--hidden-import", "logging.handlers", "--hidden-import", "queue", "--hidden-import", "random",
+            "--hidden-import", "signal", "--hidden-import", "types", "--hidden-import", "unicodedata",
+            "--hidden-import", "urllib.parse", "--hidden-import", "zoneinfo",
+            "--hidden-import", "tkinter", "--hidden-import", "tkinter.font", "--hidden-import", "tkinter.messagebox",
+            "--hidden-import", "tkinter.simpledialog", "--hidden-import", "tkinter.ttk",
+            "--collect-all", "babel", "--collect-all", "certifi", "--collect-all", "geopy",
+            "--collect-all", "hijri_converter", "--collect-all", "ntplib", "--collect-all", "pycountry",
+            "--collect-all", "requests", "--collect-all", "rich", "--collect-all", "tzdata",
+            "--collect-all", "dotenv",
+            "iftar sayaci 1.0.py"
+          )
+          python @pyArgs
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
+
+      - name: Check the version stamp
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.gate.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stamp = (Get-Item "dist/IftarSayaci.exe").VersionInfo.FileVersion
+          if ($stamp -ne $env:VERSION) { throw "The exe version stamp ($stamp) does not match APP_VERSION ($($env:VERSION))." }
+
+      - name: Publish the release
+        if: steps.gate.outputs.release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.gate.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "dist/IftarSayaci-$($env:VERSION).exe"
+          Move-Item "dist/IftarSayaci.exe" $exe
+          gh release create $env:VERSION $exe --title "Iftar Sayaci $($env:VERSION)" --notes-file release-notes.md --target $env:GITHUB_SHA
