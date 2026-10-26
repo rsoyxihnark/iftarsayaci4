@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1]
+
+- Hijri dates now use HijriDate, the supported library that replaces the deprecated hijri-converter.
+- Fixed the imsak calendar title showing an incorrect Hijri date when no conversion was available.
+- The download is now named IftarSayaci.exe, with no version number in the file name.
+
 ## [1.0.0]
 
 - Prayer times for your location, with the calculation method you choose.

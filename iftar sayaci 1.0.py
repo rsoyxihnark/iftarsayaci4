@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 import concurrent.futures
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 class StreamToLogger(io.TextIOBase):
     def __init__(self, logger, level):
@@ -103,7 +103,7 @@ class ModuleManager:
     ALLOWED_MODULES = {
         "ast", "asyncio", "babel", "babel.dates", "certifi", "collections",
         "concurrent.futures", "configparser", "datetime", "difflib", "dotenv",
-        "geopy", "hashlib", "hijri_converter", "logging.handlers",
+        "geopy", "hashlib", "hijridate", "logging.handlers",
         "ntplib", "pycountry", "queue", "random", "requests", "rich", "signal",
         "tkinter", "types", "tzdata", "unicodedata", "urllib.parse", "zoneinfo"
     }
@@ -161,7 +161,7 @@ required_modules: List[ModuleManager.ModuleInfo] = [
     ModuleManager.ModuleInfo("babel", "babel"),
     ModuleManager.ModuleInfo("certifi", "certifi"),
     ModuleManager.ModuleInfo("geopy", "geopy"),
-    ModuleManager.ModuleInfo("hijri_converter", "hijri-converter"),
+    ModuleManager.ModuleInfo("hijridate", "hijridate"),
     ModuleManager.ModuleInfo("ntplib", "ntplib"),
     ModuleManager.ModuleInfo("pycountry", "pycountry"),
     ModuleManager.ModuleInfo("requests", "requests"),
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     timezone = datetime_mod.timezone
     geopy = ModuleManager.dynamic_import("geopy")
     hashlib = ModuleManager.dynamic_import("hashlib")
-    hijri_converter = ModuleManager.dynamic_import("hijri_converter")
+    hijridate = ModuleManager.dynamic_import("hijridate")
     locale = ModuleManager.dynamic_import("locale")
     messagebox = ModuleManager.dynamic_import("tkinter.messagebox")
     ntplib = ModuleManager.dynamic_import("ntplib")
@@ -1128,16 +1128,13 @@ class IftarModel:
             else:
                 logging.warning("Hicri tarih bilgileri alınamadı: %s", e)
             try:
-                hijri_date = hijri_converter.Gregorian(today.year, today.month, today.day).to_hijri()
+                hijri_date = hijridate.Gregorian(today.year, today.month, today.day).to_hijri()
                 hicri_gun = hijri_date.day
                 hicri_ay = hijri_date.month
                 hicri_yil = hijri_date.year
             except Exception as conv_e:
                 logging.exception("Hijri tarih hesaplanamadı: %s", conv_e)
-                hicri_tahmini = today - timedelta(days=622)
-                hicri_gun = hicri_tahmini.day
-                hicri_ay = hicri_tahmini.month
-                hicri_yil = hicri_tahmini.year
+                return "İmsak Takvimi"
             hicri_ay_isimleri = [
                 "Muharrem", "Safer", "Rebiülevvel", "Rebiülahir",
                 "Cemaziyelevvel", "Cemaziyelahir", "Recep", "Şaban",
@@ -1160,7 +1157,7 @@ class IftarModel:
             else:
                 logging.warning("Hicri ay bilgileri alınamadı: %s", e)
             try:
-                hijri_date = hijri_converter.Gregorian(today.year, today.month, today.day).to_hijri()
+                hijri_date = hijridate.Gregorian(today.year, today.month, today.day).to_hijri()
                 return int(hijri_date.month)
             except Exception as conv_e:
                 logging.exception("Hijri ay hesaplanamadı: %s", conv_e)

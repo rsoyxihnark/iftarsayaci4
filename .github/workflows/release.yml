@@ -62,9 +62,22 @@ jobs:
           if (-not $changelogChanged) { throw "A version commit must update CHANGELOG.md." }
           $changelog = Get-Content -Raw -Encoding UTF8 "CHANGELOG.md"
           if ($changelog -notmatch "(?m)^## \[$([regex]::Escape($version))\]\r?$") { throw "CHANGELOG.md has no section for $version." }
-          if (git ls-remote --exit-code --tags origin "refs/tags/$version" 2>$null) { throw "Version $version has already been published." }
+          git ls-remote --exit-code --tags origin "refs/tags/$version" 2>$null | Out-Null
+          $tagExit = $LASTEXITCODE
+          if ($tagExit -eq 0) { throw "Version $version has already been published." }
+          if ($tagExit -ne 2) { throw "Could not check whether $version is already published (git exit $tagExit)." }
           "release=true" >> $env:GITHUB_OUTPUT
-          git log -1 --pretty=%b | Out-File -Encoding utf8 release-notes.md
+          exit 0
+
+      - name: Write the release notes
+        if: steps.gate.outputs.release == 'true'
+        shell: python
+        run: |
+          import subprocess
+          from pathlib import Path
+
+          notes = subprocess.run(["git", "log", "-1", "--pretty=%b"], capture_output=True, text=True, encoding="utf-8").stdout
+          Path("release-notes.md").write_text(notes, encoding="utf-8")
 
       - name: Check the text rules
         shell: python
@@ -165,7 +178,7 @@ jobs:
             "--hidden-import", "tkinter", "--hidden-import", "tkinter.font", "--hidden-import", "tkinter.messagebox",
             "--hidden-import", "tkinter.simpledialog", "--hidden-import", "tkinter.ttk",
             "--collect-all", "babel", "--collect-all", "certifi", "--collect-all", "geopy",
-            "--collect-all", "hijri_converter", "--collect-all", "ntplib", "--collect-all", "pycountry",
+            "--collect-all", "hijridate", "--collect-all", "ntplib", "--collect-all", "pycountry",
             "--collect-all", "requests", "--collect-all", "rich", "--collect-all", "tzdata",
             "--collect-all", "dotenv",
             "iftar sayaci 1.0.py"
@@ -190,6 +203,5 @@ jobs:
           VERSION: ${{ steps.gate.outputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "dist/IftarSayaci-$($env:VERSION).exe"
-          Move-Item "dist/IftarSayaci.exe" $exe
+          $exe = "dist/IftarSayaci.exe"
           gh release create $env:VERSION $exe --title "Iftar Sayaci $($env:VERSION)" --notes-file release-notes.md --target $env:GITHUB_SHA
