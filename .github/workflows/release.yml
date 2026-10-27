@@ -38,15 +38,15 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $source = Get-Content -Raw -Encoding UTF8 "iftar sayaci 1.0.py"
+          $source = Get-Content -Raw -Encoding UTF8 "iftar sayacı.py"
           $match = [regex]::Match($source, '(?m)^APP_VERSION = "(\d+\.\d+\.\d+)"\r?$')
           if (-not $match.Success) { throw "APP_VERSION is missing from the source." }
           $version = $match.Groups[1].Value
           "version=$version" >> $env:GITHUB_OUTPUT
 
           $subject = git log -1 --pretty=%s
-          $files = @(git diff-tree --no-commit-id --name-only -r --root HEAD)
-          $programChanged = $files -contains "iftar sayaci 1.0.py"
+          $files = @(git -c core.quotePath=false diff-tree --no-commit-id --name-only -r --root HEAD)
+          $programChanged = @($files | Where-Object { $_ -like "*.py" }).Count -gt 0
           $changelogChanged = $files -contains "CHANGELOG.md"
 
           if ($subject -match '^\[no release\]') {
@@ -87,7 +87,7 @@ jobs:
           from pathlib import Path
 
           failures = []
-          listing = subprocess.run(["git", "ls-files"], capture_output=True, text=True, encoding="utf-8").stdout
+          listing = subprocess.run(["git", "-c", "core.quotePath=false", "ls-files"], capture_output=True, text=True, encoding="utf-8").stdout
           for name in listing.splitlines():
               try:
                   text = Path(name).read_text(encoding="utf-8")
@@ -101,10 +101,10 @@ jobs:
               if len(line) > 248:
                   failures.append(f"CHANGELOG.md:{number}: text longer than 248 characters")
 
-          with open("iftar sayaci 1.0.py", "rb") as handle:
+          with open("iftar sayacı.py", "rb") as handle:
               for token in tokenize.tokenize(handle.readline):
                   if token.type in (tokenize.COMMENT, tokenize.STRING) and len(token.string) > 248:
-                      failures.append(f"iftar sayaci 1.0.py:{token.start[0]}: text longer than 248 characters")
+                      failures.append(f"iftar sayacı.py:{token.start[0]}: text longer than 248 characters")
 
           body = subprocess.run(["git", "log", "-1", "--pretty=%b"], capture_output=True, text=True, encoding="utf-8").stdout
           for number, line in enumerate(body.splitlines(), 1):
@@ -181,7 +181,7 @@ jobs:
             "--collect-all", "hijridate", "--collect-all", "ntplib", "--collect-all", "pycountry",
             "--collect-all", "requests", "--collect-all", "rich", "--collect-all", "tzdata",
             "--collect-all", "dotenv",
-            "iftar sayaci 1.0.py"
+            "iftar sayacı.py"
           )
           python @pyArgs
           if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
