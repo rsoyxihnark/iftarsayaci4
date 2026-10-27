@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.3]
+
+- Fixed the app installing library versions it was not tested with.
+- Fixed Açılışta Modül Güncellemelerini Kontrol Et not updating anything.
+- Fixed the program failing to load as a Python module.
+- Fixed the app applying settings changes that could not be saved.
+- Fixed the location tooltip leaving address lookups running after the pointer left.
+- Fixed the window losing its position on a screen to the left of or above the main screen.
+
 ## [1.0.2]
 
 - The window now opens right away while prayer times, the imsak calendar, and status checks load in the background.

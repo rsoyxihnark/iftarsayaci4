@@ -2,6 +2,7 @@
 # ---------------------------------------------------------------------
 # Minimal Temel İthalatlar (modüle manager için)
 # ---------------------------------------------------------------------
+import ast as ast_mod
 import os
 import sys
 import threading
@@ -11,15 +12,23 @@ import io
 import configparser
 import functools
 import importlib
+import importlib.metadata
+import importlib.util
 import json
 import logging
+import queue
 import re
 import traceback
+import types as types_mod
+import tkinter as tk
+import tkinter.font as tkFont
+import tkinter.ttk as ttk
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 import concurrent.futures
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 class StreamToLogger(io.TextIOBase):
     def __init__(self, logger, level):
@@ -112,7 +121,7 @@ class ModuleManager:
             mod = importlib.import_module(module_info.mod_name)
         if CHECK_MODULE_UPDATES:
             if module_info.ver:
-                installed_version = get_module_version(mod)
+                installed_version = get_module_version(mod, module_info.pkg)
                 if installed_version != module_info.ver:
                     logging.info("Modül '%s' sürümü (%s) gerekli (%s)'den farklı; yeniden kuruluyor.",
                                  module_info.mod_name, installed_version, module_info.ver)
@@ -129,16 +138,16 @@ class ModuleManager:
 # Gerekli modüllerin tanımlandığı liste
 # ---------------------------------------------------------------------
 required_modules: List[ModuleManager.ModuleInfo] = [
-    ModuleManager.ModuleInfo("babel", "babel"),
-    ModuleManager.ModuleInfo("certifi", "certifi"),
-    ModuleManager.ModuleInfo("geopy", "geopy"),
-    ModuleManager.ModuleInfo("hijridate", "hijridate"),
-    ModuleManager.ModuleInfo("ntplib", "ntplib"),
-    ModuleManager.ModuleInfo("pycountry", "pycountry"),
-    ModuleManager.ModuleInfo("requests", "requests"),
-    ModuleManager.ModuleInfo("rich", "rich"),
-    ModuleManager.ModuleInfo("tzdata", "tzdata"),
-    ModuleManager.ModuleInfo("dotenv", "python-dotenv"),
+    ModuleManager.ModuleInfo("babel", "babel", "2.18.0"),
+    ModuleManager.ModuleInfo("certifi", "certifi", "2026.10.23"),
+    ModuleManager.ModuleInfo("geopy", "geopy", "2.5.0"),
+    ModuleManager.ModuleInfo("hijridate", "hijridate", "2.6.0"),
+    ModuleManager.ModuleInfo("ntplib", "ntplib", "0.4.0"),
+    ModuleManager.ModuleInfo("pycountry", "pycountry", "26.2.16"),
+    ModuleManager.ModuleInfo("requests", "requests", "2.34.2"),
+    ModuleManager.ModuleInfo("rich", "rich", "15.0.0"),
+    ModuleManager.ModuleInfo("tzdata", "tzdata", "2026.5"),
+    ModuleManager.ModuleInfo("dotenv", "python-dotenv", "1.2.4"),
 ]
 
 # ---------------------------------------------------------------------
@@ -181,17 +190,35 @@ if __name__ == "__main__":
     dotenv = ModuleManager.dynamic_import("dotenv")
     dotenv.load_dotenv()
 
-def get_module_version(mod: types_mod.ModuleType) -> str:
+def get_module_version(mod: Any, package_name: Optional[str] = None) -> str:
     spec = getattr(mod, '__spec__', None)
     if spec is None or (hasattr(spec, 'origin') and spec.origin in ('built-in', 'frozen')):
         return "builtin"
-    try:
-        return importlib.metadata.version(mod.__name__.split('.')[0])
-    except importlib.metadata.PackageNotFoundError:
-        return getattr(mod, "__version__", "unknown")
-    except Exception as e:
-        logging.exception("Modül sürümü alınamadı: %s", e)
-        return "unknown"
+    module_name = getattr(mod, "__name__", "")
+    module_root = module_name.split('.')[0] if module_name else ""
+    candidates = []
+    if package_name:
+        candidates.append(package_name)
+    if module_root:
+        candidates.append(module_root)
+    for candidate in candidates:
+        try:
+            return importlib.metadata.version(candidate)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        except Exception as e:
+            logging.exception("Modül sürümü alınamadı: %s", e)
+            return "unknown"
+    if module_root:
+        try:
+            for distribution in importlib.metadata.packages_distributions().get(module_root, []):
+                try:
+                    return importlib.metadata.version(distribution)
+                except importlib.metadata.PackageNotFoundError:
+                    continue
+        except Exception as e:
+            logging.exception("Modül sürümü eşlenemedi: %s", e)
+    return getattr(mod, "__version__", "unknown")
 
 # ---------------------------------------------------------------------
 # TkManager Sınıfı: Ana Tkinter örneğini merkezi olarak saklamak için
@@ -556,8 +583,31 @@ def get_timezone_from_str(tz_str: Optional[str]) -> timezone:
     return get_utc_now().astimezone().tzinfo or timezone.utc
 
 CLEAN_TEXT_RE = re.compile(r'^[\s\u00A0\uFEFF\u200C]+|[\s\u00A0\uFEFF\u200C]+$')
-GEOMETRY_RE = re.compile(r"^\d+x\d+(\+\-?\d+){2}$")
+GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-])(-?\d+)([+-])(-?\d+)$")
 LOG_LEVEL_RE = re.compile(r"^\d{2}:\d{2}:\d{2} - (INFO|WARNING|ERROR|DEBUG) - |^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - (INFO|WARNING|ERROR|DEBUG) - ")
+
+def parse_geometry(geometry: str) -> Optional[Tuple[int, int, int, int]]:
+    if not geometry:
+        return None
+    match = GEOMETRY_RE.match(geometry)
+    if not match:
+        return None
+    width_str, height_str, x_sign, x_str, y_sign, y_str = match.groups()
+    try:
+        width = int(width_str)
+        height = int(height_str)
+        x = int(x_str)
+        y = int(y_str)
+    except ValueError:
+        return None
+    if x_sign == "-":
+        x = -x
+    if y_sign == "-":
+        y = -y
+    return width, height, x, y
+
+def format_geometry(width: int, height: int, x: int, y: int) -> str:
+    return f"{width}x{height}+{x}+{y}"
 
 def generate_cache_key(func_name: str, args: tuple, kwargs: Dict[str, Any]) -> str:
     current_date = get_utc_now().strftime('%Y-%m-%d')
@@ -679,12 +729,13 @@ class ConfigManager:
     def set(self, key: str, value: str) -> None:
         self.config["AYARLAR"][key] = value
 
-    def save(self) -> None:
+    def save(self) -> bool:
         temp_path = self.path + ".tmp"
         try:
             with open(temp_path, "w", encoding="utf-8") as configfile:
                 self.config.write(configfile)
             os.replace(temp_path, self.path)
+            return True
         except (OSError, configparser.Error) as e:
             logging.exception(f"Konfigürasyon kaydedilemedi: {e}")
             try:
@@ -692,6 +743,7 @@ class ConfigManager:
                     os.remove(temp_path)
             except OSError:
                 pass
+            return False
 
 class IftarModel:
     def __init__(self, base_dir: str, default_timeout: int, short_timeout: int, default_retries: int, backoff_factor: int) -> None:
@@ -1317,7 +1369,7 @@ class IftarModel:
             except Exception as e:
                 logging.exception("Asenkron görev başarısız: %s", e)
         future.add_done_callback(callback)
-    def perform_request_with_retry(self, url: str, retries: Optional[int] = None, backoff_factor: Optional[int] = None, timeout: Optional[int] = None, track_failures: bool = True) -> requests.Response:
+    def perform_request_with_retry(self, url: str, retries: Optional[int] = None, backoff_factor: Optional[int] = None, timeout: Optional[int] = None, track_failures: bool = True) -> "requests.Response":
         if retries is None:
             retries = self.DEFAULT_RETRIES
         if backoff_factor is None:
@@ -1334,7 +1386,7 @@ class IftarModel:
                     raise APIError("Circuit breaker açık. Hatalı uç noktalara aşırı istek gönderilmesini önlemek için API çağrısı atlanıyor.", retryable=False)
                 elif self._circuit_breaker_state == "open" and current_time >= self._circuit_breaker_open_until:
                     self._circuit_breaker_state = "half-open"
-        def operation() -> requests.Response:
+        def operation() -> "requests.Response":
             time_since_last = time.time() - self._last_api_call
             if time_since_last < self._rate_limit_interval:
                 time.sleep(self._rate_limit_interval - time_since_last)
@@ -1473,12 +1525,25 @@ class IftarController:
                 def apply_location() -> None:
                     if request_id != self._location_request_id:
                         return
+                    old_location = self.model.current_location
+                    old_latitude = self.model.current_latitude
+                    old_longitude = self.model.current_longitude
                     self.model.current_location = new_location
                     self.model.current_latitude, self.model.current_longitude = lat, lon
                     self.model.config_manager.set("konum", new_location)
                     self.model.config_manager.set("enlem", f"{lat:.6f}")
                     self.model.config_manager.set("boylam", f"{lon:.6f}")
-                    self.model.config_manager.save()
+                    if not self.model.config_manager.save():
+                        self.model.current_location = old_location
+                        self.model.current_latitude = old_latitude
+                        self.model.current_longitude = old_longitude
+                        self.model.config_manager.set("konum", old_location)
+                        self.model.config_manager.set("enlem", f"{old_latitude:.6f}" if old_latitude is not None else "")
+                        self.model.config_manager.set("boylam", f"{old_longitude:.6f}" if old_longitude is not None else "")
+                        self.log_message("Konum kaydedilemedi; değişiklik uygulanmadı.")
+                        if notify:
+                            self.view.show_error("Ayar Hatası", "Yeni konum kaydedilemedi; değişiklik uygulanmadı.")
+                        return
                     self.view.current_ezan_saatleri = ezan_saatleri
                     self.view.arayuzu_guncelle(ezan_saatleri)
                     self.view.update_countdown()
@@ -1559,9 +1624,15 @@ class IftarController:
                 def commit() -> None:
                     if request_id != self._method_request_id:
                         return
+                    old_method = self.model.current_method
                     self.model.current_method = choice
                     self.model.config_manager.set("metod", choice)
-                    self.model.config_manager.save()
+                    if not self.model.config_manager.save():
+                        self.model.current_method = old_method
+                        self.model.config_manager.set("metod", old_method)
+                        self.log_message("Hesaplama yöntemi kaydedilemedi; değişiklik uygulanmadı.")
+                        self.view.show_error("Ayar Hatası", "Hesaplama yöntemi kaydedilemedi; değişiklik uygulanmadı.")
+                        return
                     self.view.current_ezan_saatleri = ezan_saatleri
                     self.view.arayuzu_guncelle(ezan_saatleri)
                     self.view.update_countdown()
@@ -1627,6 +1698,8 @@ class IftarView:
         self.tooltip_window: Optional[tk.Toplevel] = None
         self.tooltip_after_id: Optional[str] = None
         self._tooltip_request_id: int = 0
+        self._tooltip_task: Optional[concurrent.futures.Future] = None
+        self._tooltip_fetch_semaphore = threading.BoundedSemaphore(1)
         self._location_label_request_id: int = 0
         self._country_flag_index: Optional[Dict[str, str]] = None
         self._countdown_after_id: Optional[str] = None
@@ -1643,16 +1716,26 @@ class IftarView:
         self._last_vakit_indices = None
     def toggle_module_update_check(self) -> None:
         new_val = self.check_module_updates_var.get()
+        previous_val = self.model.config_manager.get("check_module_updates", "False").lower() == "true"
         self.model.config_manager.set("check_module_updates", "True" if new_val else "False")
-        self.model.config_manager.save()
+        if not self.model.config_manager.save():
+            self.check_module_updates_var.set(previous_val)
+            self.model.config_manager.set("check_module_updates", "True" if previous_val else "False")
+            self.show_error("Ayar Hatası", "Modül güncelleme ayarı kaydedilemedi; değişiklik uygulanmadı.")
+            return
         global CHECK_MODULE_UPDATES
         CHECK_MODULE_UPDATES = new_val
         self.controller.log_message(f"Açılışta modül güncellemeleri kontrol et: {'Aktif' if new_val else 'Pasif'}")
     def toggle_developer_mode(self) -> None:
         new_val = self.developer_mode_var.get()
-        self.model.DEVELOPER_MODE = new_val
+        previous_val = bool(self.model.DEVELOPER_MODE)
         self.model.config_manager.set("DEVELOPER_MODE", "True" if new_val else "False")
-        self.model.config_manager.save()
+        if not self.model.config_manager.save():
+            self.developer_mode_var.set(previous_val)
+            self.model.config_manager.set("DEVELOPER_MODE", "True" if previous_val else "False")
+            self.show_error("Ayar Hatası", "Geliştirici modu ayarı kaydedilemedi; değişiklik uygulanmadı.")
+            return
+        self.model.DEVELOPER_MODE = new_val
         try:
             global DEVELOPER_MODE
             DEVELOPER_MODE = new_val
@@ -1676,13 +1759,11 @@ class IftarView:
             pass
         try:
             if self.pencere and self.pencere.winfo_exists() and not self.pencere.attributes("-fullscreen"):
-                geom = self.pencere.winfo_geometry()
-                width_str, rest = geom.split("x")
-                height_str, pos_str = rest.split("+", 1)
-                width = int(width_str)
-                x_offset, y_offset = map(int, pos_str.split("+"))
-                target_h = 860 if new_val else 650
-                self.pencere.geometry(f"{width}x{target_h}+{x_offset}+{y_offset}")
+                geom = parse_geometry(self.pencere.winfo_geometry())
+                if geom:
+                    width, _, x_offset, y_offset = geom
+                    target_h = 860 if new_val else 650
+                    self.pencere.geometry(format_geometry(width, target_h, x_offset, y_offset))
         except Exception:
             pass
         self.controller.log_message(f"Geliştirici Modu {'aktif' if new_val else 'pasif'} olarak güncellendi.")
@@ -1848,10 +1929,25 @@ class IftarView:
         else:
             logging.warning(f"{log_prefix} No text determined/available to copy (selection failed/empty or Label empty/error).")
 
+    def _cancel_tooltip_task(self) -> None:
+        task = self._tooltip_task
+        self._tooltip_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _fetch_tooltip_address(self, lat: float, lon: float) -> Optional[str]:
+        if not self._tooltip_fetch_semaphore.acquire(blocking=False):
+            return None
+        try:
+            return self.model.format_active_location(lat, lon)
+        finally:
+            self._tooltip_fetch_semaphore.release()
+
     def show_full_location_tooltip(self, event: tk.Event) -> None:
         x_root, y_root = event.x_root, event.y_root
         self._tooltip_request_id += 1
         request_id = self._tooltip_request_id
+        self._cancel_tooltip_task()
 
         @run_on_main_thread
         def _display_tooltip_with_text(full_text: str, x: int, y: int, token: int):
@@ -1901,10 +1997,13 @@ class IftarView:
                 try:
                     TASK_TIMEOUT = 12
                     fetched_address = await asyncio.wait_for(
-                        self.model.run_in_executor(self.model.format_active_location, lat, lon),
+                        self.model.run_in_executor(self._fetch_tooltip_address, lat, lon),
                         timeout=TASK_TIMEOUT
                     )
-                    full_address = fetched_address 
+                    if fetched_address is None:
+                        full_address = f"{lat:.2f}°, {lon:.2f}°"
+                    else:
+                        full_address = fetched_address
                     logging.debug(f"Arka planda adres alındı (async/timeout): {full_address}")
                 except asyncio.TimeoutError:
                     logging.warning(f"Tooltip için adres alma {TASK_TIMEOUT} saniyede zaman aşımına uğradı.")
@@ -1923,7 +2022,12 @@ class IftarView:
         loop = self.model.async_loop
         if loop and not loop.is_closed():
             logging.debug("Tooltip için adres getirme görevi asyncio loop'a gönderiliyor...")
-            asyncio.run_coroutine_threadsafe(_fetch_address_and_display_async(), loop)
+            try:
+                self._tooltip_task = asyncio.run_coroutine_threadsafe(_fetch_address_and_display_async(), loop)
+            except Exception as e:
+                logging.error(f"Tooltip görevi başlatılamadı: {e}", exc_info=True)
+                self._tooltip_task = None
+                _display_tooltip_with_text("Hata: Adres alınamadı", x_root, y_root, request_id)
         else:
             logging.error("Async loop çalışmıyor, tooltip adresi alınamıyor.")
             _display_tooltip_with_text("Hata: Adres alınamadı", x_root, y_root, request_id)
@@ -1946,6 +2050,7 @@ class IftarView:
 
     def cancel_tooltip(self, event: Optional[tk.Event] = None) -> None:
         self._tooltip_request_id += 1
+        self._cancel_tooltip_task()
         if self.tooltip_after_id:
             try:
                 if self.pencere and self.pencere.winfo_exists():
@@ -2098,14 +2203,10 @@ class IftarView:
         pencere_boyutu = self.get_window_geometry()
         self.windowed_geometry = pencere_boyutu
         if not self.model.DEVELOPER_MODE:
-            width_part, plus_part = pencere_boyutu.split('x', 1)
-            width_str = width_part
-            new_height = 650
-            if '+' in plus_part:
-                old_height, offset_part = plus_part.split('+', 1)
-                pencere_boyutu = f"{width_str}x{new_height}+{offset_part}"
-            else:
-                pencere_boyutu = f"{width_str}x{new_height}"
+            geom = parse_geometry(pencere_boyutu)
+            if geom:
+                width, _, x_offset, y_offset = geom
+                pencere_boyutu = format_geometry(width, 650, x_offset, y_offset)
         baslik_text = "Namaz Vakitleri"
         self.pencere.title(f"{baslik_text} - İftar Sayacı {APP_VERSION}")
         self.pencere.geometry(pencere_boyutu)
@@ -2440,21 +2541,18 @@ class IftarView:
                     self.pencere.update_idletasks()
                 current_geom = self.windowed_geometry if self.windowed_geometry else self.pencere.winfo_geometry()
                 logging.info("Kapanışta alınan pencere geometrisi: %s", current_geom)
-                try:
-                    width_str, rest = current_geom.split("x")
-                    height_str, pos_str = rest.split("+", 1)
-                    width = int(width_str)
-                    height = int(height_str)
-                    x_offset, y_offset = map(int, pos_str.split("+"))
-                except Exception as parse_err:
-                    logging.error("Geometri ayrıştırma hatası: %s", parse_err)
+                parsed_geom = parse_geometry(current_geom)
+                if parsed_geom:
+                    width, height, x_offset, y_offset = parsed_geom
+                else:
+                    logging.error("Geometri ayrıştırma hatası: %s", current_geom)
                     width, height, x_offset, y_offset = 965, 850, 480, 110
                 desired_height = 850
                 if height < desired_height:
                     fark = desired_height - height
                     logging.info("Kapanışta height değeri %d piksel düşük; düzeltme uygulanıyor.", fark)
                     height = desired_height
-                adjusted_geom = f"{width}x{height}+{x_offset}+{y_offset}"
+                adjusted_geom = format_geometry(width, height, x_offset, y_offset)
                 logging.info("Kaydedilecek pencere geometrisi: %s", adjusted_geom)
                 self.model.config_manager.set("pencere_boyutu", adjusted_geom)
                 self.model.config_manager.set("konum", self.model.current_location)
@@ -2463,7 +2561,9 @@ class IftarView:
                 self.model.config_manager.set("boylam", f"{self.model.current_longitude:.6f}" if self.model.current_longitude is not None else "")
                 self.model.config_manager.set("check_module_updates", "True" if CHECK_MODULE_UPDATES else "False")
                 self.model.config_manager.set("DEVELOPER_MODE", "True" if self.model.DEVELOPER_MODE else "False")
-                self.model.config_manager.save()
+                if not self.model.config_manager.save():
+                    logging.error("Kapanış ayarları kaydedilemedi.")
+                    safe_showerror("Ayar Hatası", "Ayarlar kaydedilemedi. Bir sonraki açılışta eski değerler kullanılacak.")
                 try:
                     after_ids = self.pencere.tk.call('after', 'info')
                     if after_ids:
@@ -2559,7 +2659,7 @@ class IftarView:
         messagebox._iftar_messagebox_patched = True
     def get_window_geometry(self) -> str:
         saved_geom = self.model.config_manager.get("pencere_boyutu", "")
-        if saved_geom and GEOMETRY_RE.match(saved_geom):
+        if saved_geom and parse_geometry(saved_geom):
             return saved_geom
         width = 965
         if not self.model.DEVELOPER_MODE:
