@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.0.4]
+
+- Fixed the packaged app trying to install a missing library by launching itself instead of showing an error.
+- Settings and activity.log now stay beside the program instead of in the folder it was started from.
+- Fixed one rejected API request blocking prayer times, the imsak calendar, and location lookups.
+- Fixed prayer times and the imsak calendar never refreshing for the new day.
+- An unsupported calculation method now falls back to Türkiye Diyanet instead of breaking prayer times.
+- Fixed importing the program still leaving some imports undefined and raising a name error.
+- Fixed prayer-time requests not sending the date, so another day's times could come back.
+- Changing the calculation method now refreshes the imsak calendar.
+- Fixed Temizle leaving the activity log with empty bytes and hiding new lines.
+- A saved location without coordinates now stays as typed and is looked up in the background.
+- Location lookups now share a cache and a one-second limit, so the tooltip, location label, and Aktif Konumu Göster stop repeating requests.
+- Settings containing a percent sign no longer fail to load or save.
+- Fixed the clock check calling a midnight date difference a time-zone difference.
+- The Yöntem Değiştir window now opens centered on the main window and cannot hide behind it.
+- Açılışta Modül Güncellemelerini Kontrol Et no longer reinstalls libraries whose version cannot be read.
+- Copying text no longer writes the clipboard contents to activity.log.
+- Fixed prayer-time and location responses with a BOM or a non-UTF-8 charset being garbled.
+- The API rate limiter is now safe when several requests run at once.
+- Fixed the location tooltip being routed through the main-thread helper twice.
+- Partial lines written to the log are now buffered and logged as complete lines.
+- The module loader now refuses packages that are not on its allowlist.
+- Repeated prayer-time requests for the same day now use the cached result.
+- Removed the unused cache code, an unreachable retry handler, other unused helpers, and leftover debug prints.
+- Failed requests no longer wait after the final attempt.
+- Right-click menus are created once and reused instead of on every click.
+- Escape now restores the window's previous size and position when leaving full screen.
+- Fixed shutdown reporting success before cleanup had finished.
+- The Hakkında window now shows real library versions, or the pinned version when it cannot read one.
+- The Hakkında window now lists the libraries the app uses instead of internal names.
+- The certificate bundle is now looked up once instead of on every request.
+- Fixed Ctrl+A in the console and command line not selecting all text.
+- Açılışta Modül Güncellemelerini Kontrol Et now reads its saved value from the program's folder.
+- The timezone fallback now follows the system's daylight saving changes.
+- The countdown and prayer highlight now share one timer.
+- Fixed the countdown percentage and duration text showing raw values.
+- Logging setup now runs only once.
+- The startup location choice is made once and no longer changed by the window.
+- Alt-F4 no longer asks for exit confirmation twice.
+- The tooltip cleanup no longer swallows unrelated errors.
+- The background callback poller now slows down when there is nothing to do.
+
 ## [1.0.3]
 
 - Fixed the app installing library versions it was not tested with.

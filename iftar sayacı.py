@@ -23,26 +23,38 @@ import types as types_mod
 import tkinter as tk
 import tkinter.font as tkFont
 import tkinter.ttk as ttk
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 import concurrent.futures
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
+
+def get_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 class StreamToLogger(io.TextIOBase):
     def __init__(self, logger, level):
         self.logger = logger
         self.level = level
         self.linebuf = ''
+        self._lock = threading.RLock()
 
     def write(self, buf):
-        for line in buf.rstrip().splitlines():
-            self.logger.log(self.level, line.rstrip())
+        with self._lock:
+            self.linebuf += buf
+            while "\n" in self.linebuf:
+                line, self.linebuf = self.linebuf.split("\n", 1)
+                self.logger.log(self.level, line.rstrip())
         return len(buf)
 
     def flush(self):
-        pass
+        with self._lock:
+            if self.linebuf:
+                self.logger.log(self.level, self.linebuf.rstrip())
+                self.linebuf = ""
 
     def isatty(self):
         return False
@@ -50,10 +62,10 @@ class StreamToLogger(io.TextIOBase):
 T = TypeVar("T")
 
 def get_check_module_updates_from_settings() -> bool:
-    settings_path = os.path.join(os.getcwd(), "settings.ini")
+    settings_path = os.path.join(get_base_dir(), "settings.ini")
     if not os.path.exists(settings_path):
         return False
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None)
     try:
         config.read(settings_path, encoding="utf-8")
         return config.get("AYARLAR", "check_module_updates", fallback="False").lower() == "true"
@@ -61,6 +73,7 @@ def get_check_module_updates_from_settings() -> bool:
         return False
 
 CHECK_MODULE_UPDATES = get_check_module_updates_from_settings()
+_LOGGING_CONFIGURED = False
 
 # ---------------------------------------------------------------------
 # ModuleManager: Tüm üçüncü taraf kütüphane import ve kurulumu bu sınıf tarafından yönetilir.
@@ -70,6 +83,9 @@ class ModuleManager:
 
     @staticmethod
     def dynamic_import(module_name: str) -> Any:
+        if module_name not in ModuleManager.ALLOWED_MODULES:
+            logging.error("İzin verilmeyen modül: %s", module_name)
+            raise ImportError(f"İzin verilmeyen modül: {module_name}")
         if not ModuleManager.VALID_PACKAGE_REGEX.match(module_name):
             logging.error("Geçersiz modül adı: %s", module_name)
             raise ImportError(f"Geçersiz modül adı: {module_name}")
@@ -86,20 +102,27 @@ class ModuleManager:
         ver: Optional[str] = None
 
     ALLOWED_MODULES = {
-        "ast", "asyncio", "babel", "babel.dates", "certifi", "collections",
+        "ast", "asyncio", "babel", "babel.dates", "certifi",
         "concurrent.futures", "configparser", "datetime", "dotenv",
-        "geopy", "hashlib", "hijridate", "logging.handlers",
-        "ntplib", "pycountry", "queue", "random", "requests", "rich", "signal",
-        "tkinter", "types", "tzdata", "unicodedata", "urllib.parse", "zoneinfo"
+        "geopy", "hijridate", "locale",
+        "ntplib", "pycountry", "queue", "random", "requests", "rich",
+        "rich.console", "rich.logging", "signal",
+        "tkinter", "tkinter.font", "tkinter.messagebox", "tkinter.simpledialog",
+        "tkinter.ttk", "types", "tzdata", "unicodedata", "urllib.parse", "zoneinfo"
     }
 
     @classmethod
     def install_module(cls, module_info: "ModuleManager.ModuleInfo") -> None:
+        if getattr(sys, "frozen", False):
+            raise ImportError(
+                f"'{module_info.mod_name}' modülü paketlenmiş uygulamada bulunamadı; yeniden kurulum yapılamaz."
+            )
         pkg = module_info.pkg if module_info.pkg else module_info.mod_name
         if not cls.VALID_PACKAGE_REGEX.match(pkg) or any(c in pkg for c in ";|&"):
             raise ValueError(f"Geçersiz veya tehlikeli paket adı: {pkg}")
         version_spec = f"=={module_info.ver}" if module_info.ver else ""
-        command = [sys.executable, "-m", "pip", "install", f"{pkg}{version_spec}", "--user"]
+        executable = getattr(sys, "executable", None) or "python"
+        command = [executable, "-m", "pip", "install", f"{pkg}{version_spec}"]
         logging.info("Modül kuruluyor: %s", " ".join(command))
         subprocess.check_call(command, shell=False)
         try:
@@ -122,78 +145,49 @@ class ModuleManager:
         if CHECK_MODULE_UPDATES:
             if module_info.ver:
                 installed_version = get_module_version(mod, module_info.pkg)
-                if installed_version != module_info.ver:
-                    logging.info("Modül '%s' sürümü (%s) gerekli (%s)'den farklı; yeniden kuruluyor.",
-                                 module_info.mod_name, installed_version, module_info.ver)
-                    cls.install_module(module_info)
+                if installed_version in ("unknown", "builtin"):
+                    logging.info(
+                        "Modül '%s' sürümü belirlenemedi (%s); yeniden kurulum atlandı.",
+                        module_info.mod_name, installed_version
+                    )
+                elif installed_version != module_info.ver:
+                    if getattr(sys, "frozen", False):
+                        logging.info(
+                            "Modül '%s' sürümü (%s) gerekli (%s) sürümden farklı; paketlenmiş uygulamada yeniden kurulum atlandı.",
+                            module_info.mod_name, installed_version, module_info.ver
+                        )
+                    else:
+                        logging.info("Modül '%s' sürümü (%s) gerekli (%s)'den farklı; yeniden kuruluyor.",
+                                     module_info.mod_name, installed_version, module_info.ver)
+                        cls.install_module(module_info)
             else:
                 logging.info("Modül '%s' için sabit sürüm tanımlı değil; otomatik güncelleme atlandı.", module_info.mod_name)
+
+    @staticmethod
+    def report_startup_failure(message: str) -> None:
+        logging.error(message)
+        try:
+            import tkinter.messagebox as startup_messagebox
+            startup_messagebox.showerror("Başlatma Hatası", message)
+        except Exception:
+            try:
+                print(message, file=sys.stderr)
+            except Exception:
+                pass
 
     @classmethod
     def ensure_required_modules(cls, modules: List["ModuleManager.ModuleInfo"]) -> None:
         for mod_info in modules:
-            cls.manage_module(mod_info)
-
-# ---------------------------------------------------------------------
-# Gerekli modüllerin tanımlandığı liste
-# ---------------------------------------------------------------------
-required_modules: List[ModuleManager.ModuleInfo] = [
-    ModuleManager.ModuleInfo("babel", "babel", "2.18.0"),
-    ModuleManager.ModuleInfo("certifi", "certifi", "2026.10.23"),
-    ModuleManager.ModuleInfo("geopy", "geopy", "2.5.0"),
-    ModuleManager.ModuleInfo("hijridate", "hijridate", "2.6.0"),
-    ModuleManager.ModuleInfo("ntplib", "ntplib", "0.4.0"),
-    ModuleManager.ModuleInfo("pycountry", "pycountry", "26.2.16"),
-    ModuleManager.ModuleInfo("requests", "requests", "2.34.2"),
-    ModuleManager.ModuleInfo("rich", "rich", "15.0.0"),
-    ModuleManager.ModuleInfo("tzdata", "tzdata", "2026.5"),
-    ModuleManager.ModuleInfo("dotenv", "python-dotenv", "1.2.4"),
-]
-
-# ---------------------------------------------------------------------
-# Global dinamik importlar
-# ---------------------------------------------------------------------
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    ModuleManager.ensure_required_modules(required_modules)
-    ast_mod = ModuleManager.dynamic_import("ast")
-    asyncio = ModuleManager.dynamic_import("asyncio")
-    babel = ModuleManager.dynamic_import("babel")
-    babel_dates = ModuleManager.dynamic_import("babel.dates")
-    collections_mod = ModuleManager.dynamic_import("collections")
-    concurrent_futures = ModuleManager.dynamic_import("concurrent.futures")
-    configparser = ModuleManager.dynamic_import("configparser")
-    datetime_mod = ModuleManager.dynamic_import("datetime")
-    datetime = datetime_mod.datetime
-    timedelta = datetime_mod.timedelta
-    timezone = datetime_mod.timezone
-    geopy = ModuleManager.dynamic_import("geopy")
-    hashlib = ModuleManager.dynamic_import("hashlib")
-    hijridate = ModuleManager.dynamic_import("hijridate")
-    locale = ModuleManager.dynamic_import("locale")
-    messagebox = ModuleManager.dynamic_import("tkinter.messagebox")
-    ntplib = ModuleManager.dynamic_import("ntplib")
-    pycountry = ModuleManager.dynamic_import("pycountry")
-    queue = ModuleManager.dynamic_import("queue")
-    random = ModuleManager.dynamic_import("random")
-    requests = ModuleManager.dynamic_import("requests")
-    rich_logging = ModuleManager.dynamic_import("rich.logging")
-    signal_mod = ModuleManager.dynamic_import("signal")
-    simpledialog = ModuleManager.dynamic_import("tkinter.simpledialog")
-    tk = ModuleManager.dynamic_import("tkinter")
-    tkFont = ModuleManager.dynamic_import("tkinter.font")
-    ttk = ModuleManager.dynamic_import("tkinter.ttk")
-    types_mod = ModuleManager.dynamic_import("types")
-    unicodedata = ModuleManager.dynamic_import("unicodedata")
-    urllib_parse = ModuleManager.dynamic_import("urllib.parse")
-    zoneinfo = ModuleManager.dynamic_import("zoneinfo")
-    dotenv = ModuleManager.dynamic_import("dotenv")
-    dotenv.load_dotenv()
+            try:
+                cls.manage_module(mod_info)
+            except Exception as e:
+                logging.exception("Gerekli modül sağlanamadı: %s", mod_info.mod_name)
+                cls.report_startup_failure(
+                    f"Gerekli Python paketi yüklenemedi: {mod_info.pkg or mod_info.mod_name}."
+                )
+                raise SystemExit(1) from e
 
 def get_module_version(mod: Any, package_name: Optional[str] = None) -> str:
-    spec = getattr(mod, '__spec__', None)
-    if spec is None or (hasattr(spec, 'origin') and spec.origin in ('built-in', 'frozen')):
-        return "builtin"
     module_name = getattr(mod, "__name__", "")
     module_root = module_name.split('.')[0] if module_name else ""
     candidates = []
@@ -218,7 +212,64 @@ def get_module_version(mod: Any, package_name: Optional[str] = None) -> str:
                     continue
         except Exception as e:
             logging.exception("Modül sürümü eşlenemedi: %s", e)
+    if module_name in sys.builtin_module_names:
+        return "builtin"
     return getattr(mod, "__version__", "unknown")
+
+# ---------------------------------------------------------------------
+# Gerekli modüllerin tanımlandığı liste
+# ---------------------------------------------------------------------
+required_modules: List[ModuleManager.ModuleInfo] = [
+    ModuleManager.ModuleInfo("babel", "babel", "2.18.0"),
+    ModuleManager.ModuleInfo("certifi", "certifi", "2026.10.23"),
+    ModuleManager.ModuleInfo("geopy", "geopy", "2.5.0"),
+    ModuleManager.ModuleInfo("hijridate", "hijridate", "2.6.0"),
+    ModuleManager.ModuleInfo("ntplib", "ntplib", "0.4.0"),
+    ModuleManager.ModuleInfo("pycountry", "pycountry", "26.2.16"),
+    ModuleManager.ModuleInfo("requests", "requests", "2.34.2"),
+    ModuleManager.ModuleInfo("rich", "rich", "15.0.0"),
+    ModuleManager.ModuleInfo("tzdata", "tzdata", "2026.5"),
+    ModuleManager.ModuleInfo("dotenv", "python-dotenv", "1.2.4"),
+]
+
+# ---------------------------------------------------------------------
+# Global dinamik importlar
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    ModuleManager.ensure_required_modules(required_modules)
+
+ast_mod = ModuleManager.dynamic_import("ast")
+asyncio = ModuleManager.dynamic_import("asyncio")
+babel = ModuleManager.dynamic_import("babel")
+babel_dates = ModuleManager.dynamic_import("babel.dates")
+concurrent_futures = ModuleManager.dynamic_import("concurrent.futures")
+configparser = ModuleManager.dynamic_import("configparser")
+datetime_mod = ModuleManager.dynamic_import("datetime")
+datetime = datetime_mod.datetime
+timedelta = datetime_mod.timedelta
+timezone = datetime_mod.timezone
+geopy = ModuleManager.dynamic_import("geopy")
+hijridate = ModuleManager.dynamic_import("hijridate")
+locale = ModuleManager.dynamic_import("locale")
+messagebox = ModuleManager.dynamic_import("tkinter.messagebox")
+ntplib = ModuleManager.dynamic_import("ntplib")
+pycountry = ModuleManager.dynamic_import("pycountry")
+queue = ModuleManager.dynamic_import("queue")
+random = ModuleManager.dynamic_import("random")
+requests = ModuleManager.dynamic_import("requests")
+rich_logging = ModuleManager.dynamic_import("rich.logging")
+signal_mod = ModuleManager.dynamic_import("signal")
+simpledialog = ModuleManager.dynamic_import("tkinter.simpledialog")
+tk = ModuleManager.dynamic_import("tkinter")
+tkFont = ModuleManager.dynamic_import("tkinter.font")
+ttk = ModuleManager.dynamic_import("tkinter.ttk")
+types_mod = ModuleManager.dynamic_import("types")
+unicodedata = ModuleManager.dynamic_import("unicodedata")
+urllib_parse = ModuleManager.dynamic_import("urllib.parse")
+zoneinfo = ModuleManager.dynamic_import("zoneinfo")
+dotenv = ModuleManager.dynamic_import("dotenv")
+dotenv.load_dotenv()
 
 # ---------------------------------------------------------------------
 # TkManager Sınıfı: Ana Tkinter örneğini merkezi olarak saklamak için
@@ -307,7 +358,8 @@ class TkManager:
     def process_callback_queue():
         now = time.monotonic()
         deferred = []
-        while not TkManager._callback_queue.empty():
+        processed = False
+        while True:
             try:
                 ready_at, cb, args, kwargs = TkManager._callback_queue.get_nowait()
             except queue.Empty:
@@ -318,6 +370,7 @@ class TkManager:
             if ready_at > now:
                 deferred.append((ready_at, cb, args, kwargs))
                 continue
+            processed = True
             try:
                 cb(*args, **kwargs)
             except Exception as e_cb_exec:
@@ -328,8 +381,12 @@ class TkManager:
                 logging.exception(f"Callback kuyruğundan '{cb_name}' yürütülürken hata: {e_cb_exec}")
         for item in deferred:
             TkManager._callback_queue.put(item)
-        if TkManager.main_instance and TkManager.main_instance.winfo_exists():
-            TkManager.main_instance.after(50, TkManager.process_callback_queue)
+        try:
+            window_exists = bool(TkManager.main_instance and TkManager.main_instance.winfo_exists())
+        except tk.TclError:
+            window_exists = False
+        if window_exists:
+            TkManager.main_instance.after(50 if processed else 250, TkManager.process_callback_queue)
         else:
             logging.debug("process_callback_queue: Ana pencere yok, tekrar zamanlanmıyor.")
 
@@ -519,12 +576,6 @@ class APIError(Exception):
         super().__init__(message)
         self.retryable = retryable
 
-class ConfigError(Exception):
-    pass
-
-class CommandExecutionError(Exception):
-    pass
-
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -545,12 +596,14 @@ def redact_url(url: str) -> str:
 
 def retry_operation(
     operation: Callable[[], T],
-    retries: int,
+    attempts: int,
     backoff_factor: int,
     retryable_exceptions: Tuple[Type[Exception], ...] = (APIError, ConnectionError, TimeoutError)
 ) -> T:
     last_error: Optional[Exception] = None
-    for attempt in range(retries):
+    if attempts < 1:
+        attempts = 1
+    for attempt in range(1, attempts + 1):
         try:
             return operation()
         except APIError as e:
@@ -558,13 +611,17 @@ def retry_operation(
                 logging.error("Yeniden denenemeyen API hatası: %s", e)
                 raise
             last_error = e
-            sleep_time = min((backoff_factor ** attempt) * random.uniform(0.5, 1.5), 10)
-            logging.warning(f"{attempt+1}. denemede geçici hata: {e}. {sleep_time:.2f} saniye sonra yeniden deneniyor.")
+            if attempt >= attempts:
+                break
+            sleep_time = min((backoff_factor ** (attempt - 1)) * random.uniform(0.5, 1.5), 10)
+            logging.warning(f"{attempt}. denemede geçici hata: {e}. {sleep_time:.2f} saniye sonra yeniden deneniyor.")
             time.sleep(sleep_time)
         except retryable_exceptions as e:
             last_error = e
-            sleep_time = min((backoff_factor ** attempt) * random.uniform(0.5, 1.5), 10)
-            logging.warning(f"{attempt+1}. denemede geçici hata: {e}. {sleep_time:.2f} saniye sonra yeniden deneniyor.")
+            if attempt >= attempts:
+                break
+            sleep_time = min((backoff_factor ** (attempt - 1)) * random.uniform(0.5, 1.5), 10)
+            logging.warning(f"{attempt}. denemede geçici hata: {e}. {sleep_time:.2f} saniye sonra yeniden deneniyor.")
             time.sleep(sleep_time)
         except Exception as e:
             logging.exception("Retry operation sırasında yeniden denenemeyen istisna oluştu: %s", e)
@@ -574,13 +631,44 @@ def retry_operation(
     else:
         raise RuntimeError("Bilinmeyen hata oluştu.")
 
-def get_timezone_from_str(tz_str: Optional[str]) -> timezone:
+class SystemLocalTimezone(tzinfo):
+    def utcoffset(self, dt):
+        if dt is None:
+            return None
+        return timedelta(seconds=-time.altzone if self._isdst(dt) else -time.timezone)
+
+    def dst(self, dt):
+        if dt is None or not time.daylight:
+            return timedelta(0)
+        if self._isdst(dt):
+            return timedelta(seconds=time.timezone - time.altzone)
+        return timedelta(0)
+
+    def tzname(self, dt):
+        if dt is None:
+            return time.tzname[0]
+        return time.tzname[1 if self._isdst(dt) else 0]
+
+    def _isdst(self, dt):
+        naive = dt.replace(tzinfo=None)
+        stamp = time.mktime((
+            naive.year, naive.month, naive.day, naive.hour,
+            naive.minute, naive.second, naive.weekday(), 0, -1
+        ))
+        return time.localtime(stamp).tm_isdst > 0
+
+def get_timezone_from_str(tz_str: Optional[str]) -> Any:
     if tz_str:
         try:
             return zoneinfo.ZoneInfo(tz_str)
         except zoneinfo.ZoneInfoNotFoundError as e:
             logging.warning("Zaman dilimi '%s' oluşturulamadı: %s. Sistem yerel zaman dilimi kullanılacak.", tz_str, e)
-    return get_utc_now().astimezone().tzinfo or timezone.utc
+    try:
+        from tzlocal import get_localzone
+        return get_localzone()
+    except Exception:
+        pass
+    return SystemLocalTimezone()
 
 CLEAN_TEXT_RE = re.compile(r'^[\s\u00A0\uFEFF\u200C]+|[\s\u00A0\uFEFF\u200C]+$')
 GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-])(-?\d+)([+-])(-?\d+)$")
@@ -609,59 +697,17 @@ def parse_geometry(geometry: str) -> Optional[Tuple[int, int, int, int]]:
 def format_geometry(width: int, height: int, x: int, y: int) -> str:
     return f"{width}x{height}+{x}+{y}"
 
-def generate_cache_key(func_name: str, args: tuple, kwargs: Dict[str, Any]) -> str:
-    current_date = get_utc_now().strftime('%Y-%m-%d')
-    sorted_kwargs = tuple(sorted((k, v) for k, v in kwargs.items()))
-    key_data = (func_name, args, sorted_kwargs, current_date)
-    return hashlib.sha256(repr(key_data).encode('utf-8')).hexdigest()
+def clamp_percentage(value: float) -> float:
+    return max(0.0, min(100.0, value))
 
-def make_cache_decorator() -> Callable[[int], Callable[[Callable[..., T]], Callable[..., T]]]:
-    def cache_result(ttl: int) -> Callable[[Callable[..., T]], Callable[..., T]]:
-        cache: Dict[str, Tuple[Any, float]] = {}
-        cache_lock = threading.RLock()
-        MAX_CACHE_SIZE = 100
-        stop_event = threading.Event()
+def format_duration(total_seconds: float) -> str:
+    seconds = max(0, int(total_seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-        def cleanup_task():
-            interval = min(ttl, 300)
-            while not stop_event.wait(interval):
-                with cache_lock:
-                    now = time.time()
-                    expired_keys = [k for k, (_, timestamp) in cache.items() if now - timestamp >= ttl]
-                    for k in expired_keys:
-                        del cache[k]
-        cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
-        cleanup_thread.start()
-
-        def decorator(func: Callable[..., T]) -> Callable[..., T]:
-            @functools.wraps(func)
-            def wrapper(*args: Any, **kwargs: Any) -> T:
-                key = generate_cache_key(func.__name__, args, kwargs)
-                now = time.time()
-                with cache_lock:
-                    if key in cache:
-                        result, timestamp = cache[key]
-                        if now - timestamp < ttl:
-                            logging.info(f"Önbellek kullanıldı: {func.__name__} (key: {key})")
-                            return result
-                        else:
-                            del cache[key]
-                result = func(*args, **kwargs)
-                with cache_lock:
-                    if len(cache) >= MAX_CACHE_SIZE:
-                        oldest_key = next(iter(cache))
-                        del cache[oldest_key]
-                    cache[key] = (result, now)
-                return result
-            wrapper._cache = cache
-            wrapper._cache_lock = cache_lock
-            wrapper._cleanup_stop_event = stop_event
-            wrapper._cleanup_thread = cleanup_thread
-            return wrapper
-        return decorator
-    return cache_result
-
-cache_result = make_cache_decorator()
+def format_percentage(value: float) -> str:
+    return f"{clamp_percentage(value):.1f}"
 
 # ---------------------------------------------------------------------
 # UYGULAMA SINIFLARI: ConfigManager, IftarModel, IftarController, IftarView
@@ -690,11 +736,11 @@ class ConfigManager:
 
     def __init__(self, path: str) -> None:
         self.path: str = path
-        self.config: configparser.ConfigParser = configparser.ConfigParser()
+        self.config: configparser.ConfigParser = configparser.ConfigParser(interpolation=None)
         self.load()
 
     def _load_defaults(self) -> None:
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(interpolation=None)
         self.config["AYARLAR"] = dict(self.DEFAULT_SETTINGS)
 
     def _backup_broken_file(self) -> None:
@@ -751,7 +797,6 @@ class IftarModel:
         self.LOG_FILE: str = os.path.join(self.BASE_DIR, "activity.log")
         self.SETTINGS_PATH: str = os.path.join(self.BASE_DIR, "settings.ini")
         self.config_manager = ConfigManager(self.SETTINGS_PATH)
-        self.DEVELOPER_MODE: bool = normalize_env_var(self.config_manager.get("DEVELOPER_MODE", "False"))
         self.DEFAULT_LOCATION: str = "İzmir, Turkey"
         self.DEFAULT_LATITUDE: float = 38.4237
         self.DEFAULT_LONGITUDE: float = 27.1428
@@ -760,8 +805,8 @@ class IftarModel:
         self.current_latitude: Optional[float] = None
         self.current_longitude: Optional[float] = None
         self.current_method: str = ""
-        self.current_country: str = ""
-        self._auto_locate_on_start: bool = False
+        self._startup_location_action: str = "none"
+        self._timezone_name: Optional[str] = None
         self.log_buffer: queue.Queue = queue.Queue()
         self.DEVELOPER_MODE: bool = normalize_env_var(self.config_manager.get("DEVELOPER_MODE", "False"))
         self.DEFAULT_TIMEOUT: int = default_timeout
@@ -769,8 +814,13 @@ class IftarModel:
         self.DEFAULT_RETRIES: int = default_retries
         self.BACKOFF_FACTOR: int = backoff_factor
         self.GLOBAL_SESSION: requests.Session = requests.Session()
-        self.GEOPY_USER_AGENT: str = "ezan_saatleri_v2"
+        self.GEOPY_USER_AGENT: str = f"IftarSayaci/{APP_VERSION}"
         self.IPINFO_API_KEY: Optional[str] = os.getenv("IPINFO_API_KEY", "").strip()
+        try:
+            self._ca_bundle: Optional[str] = ModuleManager.dynamic_import("certifi").where()
+        except Exception as e:
+            logging.warning("certifi yüklenemedi; sistem sertifika deposu kullanılacak: %s", e)
+            self._ca_bundle = None
         self._circuit_breaker_state = "closed"
         self._failure_count = 0
         self._failure_threshold = 3
@@ -785,11 +835,16 @@ class IftarModel:
         self.start_asyncio_loop()
         spec = importlib.util.find_spec("geopy")
         self.geolocator = geopy.geocoders.Nominatim(user_agent=self.GEOPY_USER_AGENT) if spec else None
+        self._geocode_cache: Dict[Tuple[float, float, str], Any] = {}
+        self._geocode_cache_lock = threading.RLock()
+        self._geocode_throttle_lock = threading.Lock()
+        self._last_geocode_time = 0.0
         self.set_locale()
         self.setup_logging()
         self.set_excepthook()
         self._rate_limit_interval = 0.20
         self._last_api_call = 0.0
+        self._rate_limit_lock = threading.Lock()
         self.initialize_settings()
         self._ezan_cache: Dict[Any, Dict[str, str]] = {}
         self._ezan_cache_lock = threading.RLock()
@@ -919,6 +974,10 @@ class IftarModel:
             logging.exception("Executor hatası: %s", e)
             raise
     def setup_logging(self) -> None:
+        global _LOGGING_CONFIGURED
+        if _LOGGING_CONFIGURED:
+            logging.debug("Loglama sistemi zaten yapılandırıldı.")
+            return
         original_stdout = sys.stdout
         original_stderr = sys.stderr
         log_queue = queue.Queue(-1)
@@ -965,6 +1024,7 @@ class IftarModel:
         logging.info("stdout artık loglama sistemine yönlendirildi.")
         if 'sys.stderr' in locals() and isinstance(sys.stderr, StreamToLogger):
             logging.info("stderr artık loglama sistemine yönlendirildi.")
+        _LOGGING_CONFIGURED = True
     def log_to_file(self, message: str) -> None:
         logging.info(message)
     def set_locale(self) -> None:
@@ -983,17 +1043,26 @@ class IftarModel:
     def log_message(self, message: str) -> None:
         logging.info(message)
     def clear_log_file(self) -> None:
-        try:
-            with open(self.LOG_FILE, 'w', encoding='utf-8') as f:
-                f.write("")
-        except OSError as e:
-            logging.exception("Log dosyası temizlenirken sorun oluştu: %s", e)
+        listener = getattr(self, "log_queue_listener", None)
+        for handler in getattr(listener, "handlers", ()) or ():
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            with handler.lock:
+                stream = handler.stream
+                if stream is None:
+                    continue
+                try:
+                    stream.seek(0)
+                    stream.truncate()
+                    stream.flush()
+                except OSError as e:
+                    logging.exception("Log dosyası temizlenirken sorun oluştu: %s", e)
         while not self.log_buffer.empty():
             self.log_buffer.get()
     def initialize_settings(self) -> None:
         self.current_location = self.config_manager.get("konum", "")
         self.current_method = self.config_manager.get("metod", "")
-        self._auto_locate_on_start = False
+        self._startup_location_action = "none"
         if self.current_location:
             coords = None
             saved_latitude = self.config_manager.get("enlem", "")
@@ -1008,51 +1077,62 @@ class IftarModel:
             if coords:
                 self.current_latitude, self.current_longitude = coords
             else:
-                logging.info("Kayıtlı konum koordinatları eksik; varsayılan konum kullanılacak ve otomatik konum denenecek.")
-                self.current_location = self.DEFAULT_LOCATION
-                self.current_latitude, self.current_longitude = self.DEFAULT_LATITUDE, self.DEFAULT_LONGITUDE
-                self._auto_locate_on_start = True
+                logging.info("Kayıtlı konumun koordinatları eksik; konum metni korunacak ve arka planda çözülecek.")
+                self._startup_location_action = "resolve"
         else:
             self.current_location = self.DEFAULT_LOCATION
             self.current_latitude, self.current_longitude = self.DEFAULT_LATITUDE, self.DEFAULT_LONGITUDE
-            self._auto_locate_on_start = True
+            self._startup_location_action = "auto"
         if not self.current_method:
             self.current_method = self.DEFAULT_METHOD
+        elif self.current_method not in METHODS:
+            logging.info(
+                "Kayıtlı hesaplama yöntemi (%s) desteklenmiyor; %s kullanılacak.",
+                self.current_method, self.DEFAULT_METHOD
+            )
+            self.current_method = self.DEFAULT_METHOD
+    def consume_startup_location_action(self) -> str:
+        action = self._startup_location_action
+        self._startup_location_action = "none"
+        return action
     @staticmethod
     def remove_diacritics(s: str) -> str:
         return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
     @staticmethod
     def clean_text(text: str) -> str:
         return CLEAN_TEXT_RE.sub('', text)
-    def format_active_location(self, lat: float, lon: float) -> str:
+    def reverse_geocode(self, lat: float, lon: float, language: str = "en") -> Any:
+        key = (round(lat, 4), round(lon, 4), language)
+        with self._geocode_cache_lock:
+            if key in self._geocode_cache:
+                return self._geocode_cache[key]
+        if not self.geolocator:
+            return None
+        with self._geocode_throttle_lock:
+            elapsed = time.monotonic() - self._last_geocode_time
+            if elapsed < 1.0:
+                time.sleep(1.0 - elapsed)
+            self._last_geocode_time = time.monotonic()
+        try:
+            location = self.geolocator.reverse(f"{lat}, {lon}", language=language, timeout=5)
+        except Exception as e:
+            logging.exception("Ters geokodlama hatası: %s", e)
+            return None
+        if location is not None:
+            with self._geocode_cache_lock:
+                if len(self._geocode_cache) >= 100:
+                    self._geocode_cache.pop(next(iter(self._geocode_cache)))
+                self._geocode_cache[key] = location
+        return location
+    def format_active_location(self, lat: Optional[float], lon: Optional[float]) -> str:
+        if lat is None or lon is None:
+            return "Konum bilgisi yok"
         if not self.geolocator:
             return f"{lat:.2f}°, {lon:.2f}° (Geopy bulunamadı)"
-        try:
-            location = self.geolocator.reverse(f"{lat}, {lon}", language='en', timeout=5)
-            if location and location.address:
-                return location.address
-            else:
-                return f"{lat:.2f}°, {lon:.2f}°"
-        except Exception as e:
-            logging.exception("Konum formatlanırken hata: %s", e)
+        location = self.reverse_geocode(lat, lon, language="en")
+        if location and location.address:
+            return location.address
         return f"{lat:.2f}°, {lon:.2f}°"
-    def konum_bilgisini_al(self) -> Optional[tuple]:
-        try:
-            if not self.geolocator:
-                self.log_message("Geopy kütüphanesi yüklü değil; varsayılan konum (İzmir, Turkey) kullanılıyor.")
-                return (self.DEFAULT_LATITUDE, self.DEFAULT_LONGITUDE)
-            self.log_message(f"Konum sorgusu: {self.current_location}")
-            location = self.geolocator.geocode(self.current_location, timeout=5)
-            if location:
-                self.current_latitude, self.current_longitude = location.latitude, location.longitude
-                self.log_message(f"Konum bulundu: {location.address} ({self.current_latitude}, {self.current_longitude})")
-                return (self.current_latitude, self.current_longitude)
-            else:
-                self.log_message("Belirtilen konum bulunamadı.")
-                return None
-        except Exception as e:
-            logging.exception("Konum sorgulaması sırasında sorun: %s", e)
-            return None
     def otomatik_konum_bul(self) -> tuple:
         try:
             if not self.geolocator:
@@ -1067,8 +1147,6 @@ class IftarModel:
             self.log_message(f"ipinfo.io yanıt kodu: {response.status_code}")
             if response.status_code == 200:
                 data = response.json()
-                ip_country = data.get("country", "")
-                self.current_country = ip_country
                 location_str = data.get("loc", "")
                 if location_str:
                     location_parts = location_str.split(",")
@@ -1077,7 +1155,7 @@ class IftarModel:
                         lon = float(location_parts[1])
                         if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
                             raise APIError("API tarafından döndürülen koordinatlar geçersiz.")
-                        location_obj = self.geolocator.reverse(f"{lat}, {lon}", timeout=5)
+                        location_obj = self.reverse_geocode(lat, lon)
                         if location_obj:
                             self.log_message(f"Otomatik konum bulundu: {location_obj.address}")
                             return (location_obj.address, lat, lon)
@@ -1085,9 +1163,21 @@ class IftarModel:
         except Exception as e:
             logging.exception("Otomatik konum sorgulaması sırasında sorun: %s", e)
         return (None, None, None)
+    def location_date_string(self) -> str:
+        tz = get_timezone_from_str(self._timezone_name)
+        return get_utc_now().astimezone(tz).strftime("%d-%m-%Y")
     def ezan_saatlerini_hesapla(self, enlem: float, boylam: float, method: str) -> Optional[Dict[str, str]]:
+        if method not in set(METHODS):
+            logging.error("Desteklenmeyen hesaplama yöntemi: %s", method)
+            return None
+        request_date = self.location_date_string()
+        cache_key = (round(enlem, 4), round(boylam, 4), method, request_date)
+        with self._ezan_cache_lock:
+            cached = self._ezan_cache.get(cache_key)
+            if cached is not None:
+                return dict(cached)
         try:
-            params = {"latitude": enlem, "longitude": boylam, "method": method}
+            params = {"latitude": enlem, "longitude": boylam, "method": method, "date": request_date}
             url = "https://api.aladhan.com/v1/timings?" + urllib_parse.urlencode(params)
             response = self.perform_request_with_retry(url, retries=3, timeout=self.DEFAULT_TIMEOUT)
             data = response.json()
@@ -1095,10 +1185,26 @@ class IftarModel:
                 error_msg = "API'den geçersiz veya beklenmeyen formatta veri alındı."
                 logging.error(error_msg + f" Alınan veri: {str(data)[:200]}...")
                 raise APIError(error_msg)
+            meta = data["data"].get("meta")
+            timezone_name = meta.get("timezone") if isinstance(meta, dict) else None
+            response_date = None
+            date_block = data["data"].get("date")
+            if isinstance(date_block, dict):
+                gregorian_block = date_block.get("gregorian")
+                if isinstance(gregorian_block, dict):
+                    response_date = gregorian_block.get("date")
+            if timezone_name:
+                self._timezone_name = timezone_name
+            if response_date and response_date != request_date:
+                logging.error("Ezan saatleri istenen tarih (%s) yerine %s tarihi için döndü.", request_date, response_date)
+                raise APIError("Ezan saatleri istenen tarih için alınamadı.", retryable=False)
             timings = {k.lower(): v for k, v in data["data"]["timings"].items()}
-            timezone_name = data["data"].get("meta", {}).get("timezone")
             if timezone_name:
                 timings["timezone"] = timezone_name
+            with self._ezan_cache_lock:
+                if len(self._ezan_cache) >= 32:
+                    self._ezan_cache.pop(next(iter(self._ezan_cache)))
+                self._ezan_cache[cache_key] = dict(timings)
             return timings
         except requests.exceptions.ConnectionError as e:
             logging.error("Bağlantı hatası: %s", e)
@@ -1115,32 +1221,16 @@ class IftarModel:
         except Exception as e:
             logging.exception("Ezan saatleri işlenirken beklenmeyen bir hata oluştu: %s", e)
             return None
-    def ramazan_tarihlerini_al(self) -> tuple:
-        now = get_utc_now()
-        yil = now.year
-        url = f"https://api.aladhan.com/v1/gToHCalendar/{yil}/9"
-        self.log_message(f"Ramazan tarihleri sorgusu: {url}")
-        try:
-            response = self.perform_request_with_retry(url, retries=3, timeout=self.DEFAULT_TIMEOUT)
-            self.log_message(f"Ramazan API yanıt kodu: {response.status_code}")
-            if response.status_code == 200:
-                data = response.json()
-                if "data" in data and isinstance(data["data"], list) and len(data["data"]) >= 30:
-                    ramazan_baslangic = datetime.strptime(data["data"][0]["gregorian"]["date"], "%d-%m-%Y")
-                    ramazan_bitis = datetime.strptime(data["data"][29]["gregorian"]["date"], "%d-%m-%Y")
-                    return (ramazan_baslangic, ramazan_bitis)
-                else:
-                    self.log_message("Ramazan tarihleri beklenmeyen veri yapısı içeriyor.")
-                    return (None, None)
-            else:
-                self.log_message("Ramazan tarihleri alınamadı.")
-                return (None, None)
-        except Exception as e:
-            logging.exception("Ramazan tarihleri alınamadı: %s", e)
-            return (None, None)
     def ramazan_mi(self) -> bool:
+        if self.current_latitude is None or self.current_longitude is None:
+            return self.get_current_hijri_month() == 9
         try:
-            params = {"latitude": self.current_latitude, "longitude": self.current_longitude, "method": self.current_method}
+            params = {
+                "latitude": self.current_latitude,
+                "longitude": self.current_longitude,
+                "method": self.current_method,
+                "date": self.location_date_string()
+            }
             url = "https://api.aladhan.com/v1/timings?" + urllib_parse.urlencode(params)
             self.log_message(f"Ramazan kontrol sorgusu: {url}")
             response = self.perform_request_with_retry(url, retries=3, timeout=self.DEFAULT_TIMEOUT)
@@ -1326,7 +1416,7 @@ class IftarModel:
             local_tarih = local_time.date()
             gun_farki = (local_tarih - ntp_tarih).days
             if abs(gun_farki) == 1:
-                tarih_durumu = "Doğru ✅ (Saat Dilimi Farkı)"
+                tarih_durumu = "Doğru ✅ (Gece Yarısı Farkı)"
             elif gun_farki == 0:
                 tarih_durumu = "Doğru ✅"
             else:
@@ -1378,74 +1468,90 @@ class IftarModel:
             timeout = self.DEFAULT_TIMEOUT
         if track_failures:
             with self._circuit_breaker_lock:
-                current_time = time.time()
+                current_time = time.monotonic()
                 if self._circuit_breaker_state == "open" and current_time < self._circuit_breaker_open_until:
+                    remaining = self._circuit_breaker_open_until - current_time
                     logging.warning(
-                        f"Circuit breaker şu anda açık. API çağrısı atlanıyor. Açık kalma süresi {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._circuit_breaker_open_until))} zamanına kadar devam edecek."
+                        "Circuit breaker şu anda açık. API çağrısı atlanıyor. Yaklaşık %.0f saniye sonra yeniden denenecek.",
+                        remaining
                     )
                     raise APIError("Circuit breaker açık. Hatalı uç noktalara aşırı istek gönderilmesini önlemek için API çağrısı atlanıyor.", retryable=False)
                 elif self._circuit_breaker_state == "open" and current_time >= self._circuit_breaker_open_until:
                     self._circuit_breaker_state = "half-open"
         def operation() -> "requests.Response":
-            time_since_last = time.time() - self._last_api_call
-            if time_since_last < self._rate_limit_interval:
-                time.sleep(self._rate_limit_interval - time_since_last)
-            self._last_api_call = time.time()
+            with self._rate_limit_lock:
+                time_since_last = time.monotonic() - self._last_api_call
+                if time_since_last < self._rate_limit_interval:
+                    time.sleep(self._rate_limit_interval - time_since_last)
+                self._last_api_call = time.monotonic()
             try:
-                certifi = ModuleManager.dynamic_import("certifi")
-                response = self.GLOBAL_SESSION.get(url, timeout=timeout, verify=certifi.where())
+                response = self.GLOBAL_SESSION.get(url, timeout=timeout, verify=self._ca_bundle)
                 response.raise_for_status()
             except requests.RequestException as e:
-                if track_failures:
+                status_code = e.response.status_code if isinstance(e, requests.HTTPError) and e.response is not None else None
+                client_error = status_code is not None and 400 <= status_code < 500
+                if track_failures and not client_error:
                     with self._circuit_breaker_lock:
                         self._failure_count += 1
                         if self._failure_count >= self._failure_threshold:
                             self._circuit_breaker_state = "open"
-                            self._circuit_breaker_open_until = time.time() + self._circuit_breaker_reset_timeout
+                            self._circuit_breaker_open_until = time.monotonic() + self._circuit_breaker_reset_timeout
                             logging.warning(
-                                f"Arka arkaya {self._failure_count} başarısız deneme nedeniyle circuit breaker açıldı."
-                                f"Açık kalma süresi {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._circuit_breaker_open_until))} zamanına kadar devam ediyor"
-                                f"(yaklaşık {self._circuit_breaker_reset_timeout} saniye)."
+                                "Arka arkaya %d başarısız deneme nedeniyle circuit breaker açıldı. Yaklaşık %d saniye boyunca API çağrıları atlanacak.",
+                                self._failure_count, self._circuit_breaker_reset_timeout
                             )
-                logging.error("API isteği başarısız oldu: %s", type(e).__name__)
-                raise APIError("API isteği başarısız oldu.") from e
+                logging.error("API isteği başarısız oldu: %s (HTTP %s)", type(e).__name__, status_code or "yok")
+                message = f"API isteği başarısız oldu (HTTP {status_code})." if status_code else "API isteği başarısız oldu."
+                raise APIError(message, retryable=not client_error) from e
             if not response.content:
                 raise APIError("API'den boş veri alındı. Lütfen internet bağlantınızı kontrol edin.", retryable=False)
             content_type = (response.headers.get('Content-Type', '') or '').lower()
             if 'application/json' not in content_type:
                 raise APIError("API, JSON formatında veri döndürmüyor. Lütfen API belgelerini kontrol edin.", retryable=False)
 
-            raw_text = response.text or ""
-            cleaned_text = CLEAN_TEXT_RE.sub("", raw_text)
+            raw_bytes = response.content
+            encoding = response.encoding or "utf-8"
+            try:
+                raw_text = raw_bytes.decode(encoding)
+            except (LookupError, UnicodeDecodeError):
+                encoding = "utf-8"
+                raw_text = raw_bytes.decode(encoding, errors="replace")
+            cleaned_text = CLEAN_TEXT_RE.sub("", raw_text.lstrip("\ufeff"))
             if not cleaned_text:
                 raise APIError("API'den boş veri alındı. Lütfen internet bağlantınızı kontrol edin.", retryable=False)
-            if cleaned_text != raw_text:
-                try:
-                    response._content = cleaned_text.encode(response.encoding or "utf-8")
-                except Exception:
-                    response._content = cleaned_text.encode("utf-8", errors="replace")
-                    response.encoding = "utf-8"
+            response.encoding = encoding
 
             try:
                 _ = response.json()
             except json.JSONDecodeError as je:
-                if getattr(self, "DEVELOPER_MODE", False):
-                    logging.exception("JSON decode hatası. [Detaylar gizlendi]")
-                else:
-                    logging.warning("JSON decode hatası. [Detaylar gizlendi]")
-                raise APIError("Geçersiz JSON yanıtı alındı.", retryable=False) from je
+                if cleaned_text == raw_text:
+                    if getattr(self, "DEVELOPER_MODE", False):
+                        logging.exception("JSON decode hatası. [Detaylar gizlendi]")
+                    else:
+                        logging.warning("JSON decode hatası. [Detaylar gizlendi]")
+                    raise APIError("Geçersiz JSON yanıtı alındı.", retryable=False) from je
+                response._content = cleaned_text.encode(encoding, errors="replace")
+                try:
+                    _ = response.json()
+                except json.JSONDecodeError as je_cleaned:
+                    if getattr(self, "DEVELOPER_MODE", False):
+                        logging.exception("JSON decode hatası. [Detaylar gizlendi]")
+                    else:
+                        logging.warning("JSON decode hatası. [Detaylar gizlendi]")
+                    raise APIError("Geçersiz JSON yanıtı alındı.", retryable=False) from je_cleaned
             if track_failures:
                 with self._circuit_breaker_lock:
                     self._failure_count = 0
                     self._circuit_breaker_state = "closed"
+                    self._circuit_breaker_open_until = 0.0
             return response
         safe_url = redact_url(url)
         try:
             result = retry_operation(operation, retries, backoff_factor)
             self.log_message(f"{safe_url} adresine yapılan istek başarılı. Durum: {result.status_code}")
             return result
-        except requests.RequestException:
-            logging.exception("Hata: %s adresine yapılan istek %d denemede başarısız oldu. [Detaylar gizlendi]", safe_url, retries)
+        except APIError as e:
+            logging.error("Hata: %s adresine yapılan istek %d denemede başarısız oldu: %s", safe_url, retries, e)
             raise
 
 class LogBufferHandler(logging.Handler):
@@ -1459,11 +1565,24 @@ class LogBufferHandler(logging.Handler):
         except Exception as e:
             self.handleError(record)
 
+# Prayer-time calculation methods used by the method picker and the prayer-time request.
+METHODS = {
+    "2": "MWL (Muslim World League)",
+    "4": "Egypt (Egyptian General Authority of Survey)",
+    "5": "Mekke (Umm al-Qura, Mekke)",
+    "7": "Tahran (Institute of Geophysics, University of Tehran)",
+    "9": "Körfez Bölgesi",
+    "10": "Kuveyt",
+    "11": "Katar",
+    "12": "ISNA (Islamic Society of North America)",
+    "13": "Türkiye Diyanet",
+    "15": "Jafari (Shia Ithna-Ashari, Leva Research Institute, Qum)"
+}
+
 class IftarController:
     def __init__(self, model: IftarModel) -> None:
         self.model: IftarModel = model
         self.view: Optional["IftarView"] = None
-        self.resize_after_id: Optional[str] = None
         self._location_request_id: int = 0
         self._method_request_id: int = 0
     def set_view(self, view: "IftarView") -> None:
@@ -1490,8 +1609,10 @@ class IftarController:
                 TkManager.safe_after(0, lambda: self.view.update_sistem_saati_label(result_icon, result_msg), run_in_thread=False, context="FinalizeSystemCheck")
             self.log_message(f"Sistem Saati Kontrolü: {result_icon} {result_msg}")
         threading.Thread(target=check_and_update, daemon=True).start()
-    def konum_guncelle(self, notify: bool = True) -> None:
-        if notify:
+    def konum_guncelle(self, notify: bool = True, resolve_text: bool = False) -> None:
+        if resolve_text:
+            self.log_message(f"Kayıtlı konum çözümleniyor: {self.model.current_location}")
+        elif notify:
             self.log_message("Otomatik konum güncelleme butonuna basıldı.")
         else:
             self.log_message("Otomatik konum güncelleme başlatıldı.")
@@ -1499,7 +1620,25 @@ class IftarController:
         request_id = self._location_request_id
         async def task_async() -> None:
             try:
-                new_location, lat, lon = await self.model.run_in_executor(self.model.otomatik_konum_bul)
+                if resolve_text:
+                    if not self.model.geolocator:
+                        self.log_message("Kayıtlı konum çözümlenemedi; geopy kullanılamıyor.")
+                        return
+                    location_obj = await self.model.run_in_executor(
+                        self.model.geolocator.geocode, self.model.current_location, timeout=5
+                    )
+                    if request_id != self._location_request_id:
+                        return
+                    if not location_obj:
+                        self.log_message("Kayıtlı konum çözümlenemedi; konum metni korunuyor.")
+                        if notify:
+                            TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", "Kayıtlı konum çözümlenemedi. Lütfen konumu kontrol edin."), run_in_thread=False, context="SavedLocationError")
+                        return
+                    new_location = self.model.current_location
+                    lat, lon = location_obj.latitude, location_obj.longitude
+                    self.log_message(f"Kayıtlı konum çözümlendi: {new_location} ({lat}, {lon})")
+                else:
+                    new_location, lat, lon = await self.model.run_in_executor(self.model.otomatik_konum_bul)
                 if request_id != self._location_request_id:
                     return
                 if not new_location:
@@ -1556,7 +1695,8 @@ class IftarController:
             except Exception as e:
                 logging.exception("Konum güncelleme sırasında hata: %s", e)
                 if notify:
-                    TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", f"Konum güncellenirken bir hata oluştu:\n{e}"), run_in_thread=False, context="LocationUpdateException")
+                    error_message = f"Konum güncellenirken bir hata oluştu:\n{e}"
+                    TkManager.safe_after(0, lambda message=error_message: safe_showerror("Konum Hatası", message), run_in_thread=False, context="LocationUpdateException")
         try:
             loop = self.model.async_loop
             if loop and not loop.is_closed():
@@ -1575,24 +1715,14 @@ class IftarController:
             TkManager.safe_after(0, lambda: self.view.show_info(f"Aktif Konum: {full_location}"), run_in_thread=False, context="ShowCurrentLocation")
         threading.Thread(target=worker, daemon=True).start()
     def metod_degistir(self) -> None:
-        methods = {
-            "2": "MWL (Muslim World League)",
-            "4": "Egypt (Egyptian General Authority of Survey)",
-            "5": "Mekke (Umm al-Qura, Mekke)",
-            "7": "Tahran (Institute of Geophysics, University of Tehran)",
-            "9": "Körfez Bölgesi",
-            "10": "Kuveyt",
-            "11": "Katar",
-            "12": "ISNA (Islamic Society of North America)",
-            "13": "Türkiye Diyanet",
-            "15": "Jafari (Shia Ithna-Ashari, Leva Research Institute, Qum)"
-        }
         method_window = tk.Toplevel(self.view.pencere)
         method_window.title("Hesaplama Yöntemi Seç")
+        method_window.transient(self.view.pencere)
+        method_window.resizable(False, False)
         method_window.grab_set()
         method_window.focus_force()
         selected_method = tk.StringVar(value=self.model.current_method)
-        for method_num, method_name in methods.items():
+        for method_num, method_name in METHODS.items():
             is_selected = method_num == self.model.current_method
             emoji = " ✅" if is_selected else ""
             method_label = f"({method_num}) {method_name}{emoji}"
@@ -1605,7 +1735,7 @@ class IftarController:
                 return
             self._method_request_id += 1
             request_id = self._method_request_id
-            method_name = methods[choice]
+            method_name = METHODS[choice]
             self.log_message(f"Hesaplama yöntemi değiştiriliyor: {method_name}")
             lat = self.model.current_latitude
             lon = self.model.current_longitude
@@ -1638,6 +1768,15 @@ class IftarController:
                     self.view.update_countdown()
                     self.log_message(f"Hesaplama yöntemi güncellendi: {method_name}")
                     self.view.show_info(f"Hesaplama yöntemi güncellendi: {method_name}")
+                    def calendar_worker() -> None:
+                        takvim = self.model.imsakiye_takvimini_al()
+                        if not takvim:
+                            return
+                        def apply_calendar() -> None:
+                            if request_id == self._method_request_id:
+                                self.view.guncelle_takvim(takvim)
+                        TkManager.safe_after(0, apply_calendar, run_in_thread=False, context="ApplyMethodCalendar")
+                    threading.Thread(target=calendar_worker, daemon=True).start()
                 TkManager.safe_after(0, commit, run_in_thread=False, context="MethodChanged")
             threading.Thread(target=worker, daemon=True).start()
         ttk.Button(method_window, text="Uygula", command=apply_method).pack(pady=5)
@@ -1648,19 +1787,27 @@ class IftarController:
         method_window.update_idletasks()
         w = method_window.winfo_width()
         h = method_window.winfo_height()
-        ws = method_window.winfo_screenwidth()
-        hs = method_window.winfo_screenheight()
-        x = (ws // 2) - (w // 2)
-        y = (hs // 2) - (h // 2)
-        method_window.geometry(f'{w}x{h}+{x}+{y}')
+        parent = self.view.pencere
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        x = px + max((pw - w) // 2, 0)
+        y = py + max((ph - h) // 2, 0)
+        method_window.geometry(f"{w}x{h}+{x}+{y}")
     def show_about(self) -> None:
-        imported_modules = {name: mod for name, mod in globals().items() if isinstance(mod, types_mod.ModuleType)}
-        module_names = sorted(imported_modules.keys(), key=lambda n: n.lower())
         about_lines = []
-        for name in module_names:
-            mod = imported_modules[name]
-            version_info = get_module_version(mod)
-            about_lines.append(f"{name}: {version_info}")
+        for module_info in required_modules:
+            try:
+                mod = importlib.import_module(module_info.mod_name)
+                version_info = get_module_version(mod, module_info.pkg)
+            except Exception as e:
+                logging.exception("Hakkında penceresi için modül bilgisi alınamadı: %s", e)
+                version_info = "unknown"
+            if version_info in ("unknown", "builtin") and module_info.ver:
+                version_info = module_info.ver
+            about_lines.append(f"{module_info.mod_name}: {version_info}")
         apiler = [
             "Namaz Vakitleri - api.aladhan.com",
             "Konum - ipinfo.io",
@@ -1668,6 +1815,8 @@ class IftarController:
         ]
         about_text = f"Sürüm: {APP_VERSION}\n\nYüklü kütüphaneler ve sürümleri:\n" + "\n".join(about_lines)
         about_text += "\n\nAPI Alan Adresleri:\n" + "\n".join(apiler)
+        if len(about_text) > 1023:
+            about_text = about_text[:1020] + "..."
         if self.view:
             self.view.show_info(about_text)
         else:
@@ -1689,9 +1838,7 @@ class IftarView:
         self.default_font: Optional[tkFont.Font] = None
         self.bold_font: Optional[tkFont.Font] = None
         self.large_bold_font: Optional[tkFont.Font] = None
-        self.button_font: Optional[tkFont.Font] = None
         self.vakit_cerceve: Optional[tk.Frame] = None
-        self.resize_after_id: Optional[str] = None
         self.windowed_geometry: Optional[str] = None
         self.static_prefix = "📍 Aktif Konum: "
         self.dynamic_entry: Optional[tk.Entry] = None
@@ -1703,6 +1850,10 @@ class IftarView:
         self._location_label_request_id: int = 0
         self._country_flag_index: Optional[Dict[str, str]] = None
         self._countdown_after_id: Optional[str] = None
+        self._countdown_date = None
+        self._daily_refresh_in_progress = False
+        self._text_context_menu: Optional[tk.Menu] = None
+        self._tree_context_menu: Optional[tk.Menu] = None
         self._last_configure_time: float = 0
         self._stored_selection: str = ""
         self.aktif_konum_frame: Optional[tk.Frame] = None
@@ -1725,7 +1876,11 @@ class IftarView:
             return
         global CHECK_MODULE_UPDATES
         CHECK_MODULE_UPDATES = new_val
-        self.controller.log_message(f"Açılışta modül güncellemeleri kontrol et: {'Aktif' if new_val else 'Pasif'}")
+        self.controller.log_message(
+            f"Açılışta modül güncellemeleri kontrol et: {'Aktif' if new_val else 'Pasif'}; değişiklik bir sonraki açılışta geçerli olacak."
+        )
+        if getattr(sys, "frozen", False):
+            self.controller.log_message("Paketlenmiş uygulamada modül güncellemesi yapılmaz.")
     def toggle_developer_mode(self) -> None:
         new_val = self.developer_mode_var.get()
         previous_val = bool(self.model.DEVELOPER_MODE)
@@ -1772,13 +1927,6 @@ class IftarView:
             self._stored_selection = event.widget.selection_get()
         except tk.TclError:
             self._stored_selection = ""
-    def store_full_location_data(self) -> str:
-        if self.model.current_latitude is not None and self.model.current_longitude is not None:
-            return self.model.format_active_location(self.model.current_latitude, self.model.current_longitude)
-        else:
-            return "❌ Konum alınamadı."
-    def get_display_location_data(self) -> str:
-        return self.store_full_location_data()
     def Aktif_Konum_Labeli_uygulama_sagligi_icinde_widget_V2(self) -> None:
         self._location_label_request_id += 1
         request_id = self._location_label_request_id
@@ -1817,7 +1965,7 @@ class IftarView:
             if lat is not None and lon is not None:
                 if self.model.geolocator:
                     try:
-                        location = self.model.geolocator.reverse(f"{lat}, {lon}", language="en", timeout=5)
+                        location = self.model.reverse_geocode(lat, lon, language="en")
                         if location:
                             address_details = location.raw.get("address", {})
                             city = address_details.get("city") or address_details.get("state") or ""
@@ -1849,14 +1997,20 @@ class IftarView:
             TkManager.safe_after(0, lambda: self._update_dynamic_entry(active_text), run_in_thread=False, context="UpdateLocationLabel")
         threading.Thread(target=heavy_task, daemon=True).start()
     def toggle_fullscreen(self, event: tk.Event = None) -> str:
-        is_fullscreen = self.pencere.attributes("-fullscreen")
-        if not is_fullscreen:
+        if not self.pencere.attributes("-fullscreen"):
             self.windowed_geometry = self.pencere.geometry()
             self.pencere.attributes("-fullscreen", True)
         else:
-            self.pencere.attributes("-fullscreen", False)
-            if self.windowed_geometry:
-                self.pencere.geometry(self.windowed_geometry)
+            self.exit_fullscreen()
+        return "break"
+    def exit_fullscreen(self, event: tk.Event = None) -> str:
+        try:
+            if self.pencere.attributes("-fullscreen"):
+                self.pencere.attributes("-fullscreen", False)
+                if self.windowed_geometry:
+                    self.pencere.geometry(self.windowed_geometry)
+        except tk.TclError as e:
+            logging.debug("Tam ekrandan çıkılırken pencere hatası: %s", e)
         return "break"
     def _update_dynamic_entry(self, text: str) -> None:
         if self.dynamic_entry:
@@ -1865,69 +2019,60 @@ class IftarView:
             self.dynamic_entry.delete(0, "end")
             self.dynamic_entry.insert(0, clean_text)
             self.dynamic_entry.config(state="readonly")
-    def show_text_context_menu(self, event: tk.Event) -> None:
-        widget = event.widget
-        menu = tk.Menu(self.pencere, tearoff=0)
-        menu.add_command(label="Kopyala", command=lambda: self.copy_text_from_widget(widget))
-        menu.tk_popup(event.x_root, event.y_root)
-        menu.grab_release()
+    def show_text_context_menu(self, event: tk.Event, widget: Optional[tk.Widget] = None) -> str:
+        target = widget if widget is not None else event.widget
+        if self._text_context_menu is None:
+            self._text_context_menu = tk.Menu(self.pencere, tearoff=0)
+            self._text_context_menu.add_command(label="Kopyala", command=lambda: None)
+        self._text_context_menu.entryconfig(0, command=lambda: self.copy_text_from_widget(target))
+        try:
+            self._text_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._text_context_menu.grab_release()
+        return "break"
+
+    def show_tree_context_menu(self, event: tk.Event, tree_widget: ttk.Treeview) -> str:
+        item_id = tree_widget.identify_row(event.y)
+        if not item_id:
+            return "break"
+        tree_widget.selection_set(item_id)
+        if self._tree_context_menu is None:
+            self._tree_context_menu = tk.Menu(self.pencere, tearoff=0)
+            self._tree_context_menu.add_command(label="Kopyala", command=lambda: None)
+        self._tree_context_menu.entryconfig(0, command=lambda: self.copy_treeview_selection(tree_widget))
+        try:
+            self._tree_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._tree_context_menu.grab_release()
+        return "break"
 
     def copy_text_from_widget(self, widget: tk.Widget) -> None:
-        current_instance_id = id(widget)
-        current_widget_type = type(widget).__name__
-        log_prefix = f"[Patcher V3][Widget ID: {current_instance_id}, Type: {current_widget_type}]"
-        logging.debug(f"{log_prefix} copy_text_from_widget başlatıldı.")
         text_to_copy = ""
-        selection_attempted = False
-        get_attempted = False
-        selection_found = False
-        label_get_success = False
         try:
             if isinstance(widget, (tk.Entry, tk.Text)):
-                selection_attempted = True
-                text_to_copy = widget.selection_get()
-                selection_found = True
-                self._stored_selection = text_to_copy
-                logging.debug(f"{log_prefix} Selection found: '{text_to_copy}'")
-            elif isinstance(widget, tk.Label):
-                get_attempted = True
-                text_to_copy = widget.cget("text")
-                label_get_success = True
-                logging.debug(f"{log_prefix} Label text got: '{text_to_copy}'")
-        except tk.TclError:
-            if selection_attempted and widget is self.dynamic_entry and self._stored_selection:
-                text_to_copy = self._stored_selection
-                selection_found = True
-                logging.info(f"{log_prefix} selection_get() failed; stored selection used.")
-            elif selection_attempted:
-                logging.warning(f"{log_prefix} selection_get() failed (No selection).")
-            else:
-                logging.error(f"{log_prefix} TclError occurred, but selection wasn't attempted (check widget type or cget).")
-        except Exception as e_outer:
-            logging.error(f"{log_prefix} Error getting text: {e_outer}", exc_info=True)
-            text_to_copy = ""
-        text_determination_result = "Selection" if selection_found else ("LabelGet" if label_get_success else "Failed/NoSelection")
-        logging.info(f"{log_prefix} Text determination result: {text_determination_result}. Final text to copy: '{text_to_copy}'")
-        if text_to_copy:
-            try:
-                logging.info(f"{log_prefix} Attempting to copy to clipboard: '{text_to_copy}'")
-                self.pencere.clipboard_clear()
-                self.pencere.clipboard_append(text_to_copy)
                 try:
-                    clipboard_after = self.pencere.clipboard_get()
-                    logging.debug(f"{log_prefix} Clipboard content after append (Verification): '{clipboard_after}'")
-                    if clipboard_after == text_to_copy:
-                        logging.info(f"{log_prefix} Clipboard verification PASSED.")
-                    else:
-                        logging.error(f"{log_prefix} !! Clipboard verification FAILED !! Expected: '{text_to_copy}', Got: '{clipboard_after}'")
-                except Exception as e_verify:
-                    logging.warning(f"{log_prefix} Clipboard verification check failed: {e_verify}")
-
-            except Exception as e_clip:
-                logging.error(f"{log_prefix} Clipboard operation failed: {e_clip}", exc_info=True)
-                safe_showerror("Kopyalama Hatası", f"Panoya kopyalarken hata oluştu:\n{e_clip}")
-        else:
-            logging.warning(f"{log_prefix} No text determined/available to copy (selection failed/empty or Label empty/error).")
+                    text_to_copy = widget.selection_get()
+                except tk.TclError:
+                    if widget is self.dynamic_entry:
+                        text_to_copy = self._stored_selection
+            elif isinstance(widget, tk.Label):
+                text_to_copy = widget.cget("text")
+        except Exception as e:
+            logging.exception("Panoya kopyalanacak metin alınamadı: %s", e)
+            return
+        if not text_to_copy:
+            logging.info("Panoya kopyalanacak metin seçilmedi (kaynak: %s).", type(widget).__name__)
+            return
+        try:
+            self.pencere.clipboard_clear()
+            self.pencere.clipboard_append(text_to_copy)
+            logging.info(
+                "Panoya %d karakter kopyalandı (kaynak: %s).",
+                len(text_to_copy), type(widget).__name__
+            )
+        except tk.TclError as e:
+            logging.exception("Panoya kopyalama başarısız: %s", e)
+            safe_showerror("Kopyalama Hatası", f"Panoya kopyalarken hata oluştu:\n{e}")
 
     def _cancel_tooltip_task(self) -> None:
         task = self._tooltip_task
@@ -1949,7 +2094,6 @@ class IftarView:
         request_id = self._tooltip_request_id
         self._cancel_tooltip_task()
 
-        @run_on_main_thread
         def _display_tooltip_with_text(full_text: str, x: int, y: int, token: int):
             if token != self._tooltip_request_id:
                 return
@@ -1985,15 +2129,17 @@ class IftarView:
             except Exception as e_create:
                 logging.error(f"Tooltip oluşturulurken hata: {e_create}", exc_info=True)
                 if self.tooltip_window and self.tooltip_window.winfo_exists():
-                    try: self.tooltip_window.destroy()
-                    except: pass
+                    try:
+                        self.tooltip_window.destroy()
+                    except tk.TclError:
+                        pass
                 self.tooltip_window = None
 
         async def _fetch_address_and_display_async():
             lat = self.model.current_latitude
             lon = self.model.current_longitude
-            full_address = f"{lat:.2f}°, {lon:.2f}° (Adres alınamadı)"
             if lat is not None and lon is not None:
+                full_address = f"{lat:.2f}°, {lon:.2f}° (Adres alınamadı)"
                 try:
                     TASK_TIMEOUT = 12
                     fetched_address = await asyncio.wait_for(
@@ -2104,80 +2250,99 @@ class IftarView:
             TkManager.safe_after(0, self.update_countdown, run_in_thread=False, context="UpdateCountdown-ThreadRedirect")
             return
         self._cancel_countdown_timer()
-        if not self.current_ezan_saatleri:
+        try:
+            if not self.current_ezan_saatleri:
+                return
+            tz_str = self.current_ezan_saatleri.get("timezone")
+            tz = get_timezone_from_str(tz_str)
+            now = get_utc_now().astimezone(tz)
+            local_date = now.date()
+            if self._countdown_date is None:
+                self._countdown_date = local_date
+            elif self._countdown_date != local_date and not self._daily_refresh_in_progress:
+                self._countdown_date = local_date
+                self._daily_refresh_in_progress = True
+                refresh_lat = self.model.current_latitude
+                refresh_lon = self.model.current_longitude
+                refresh_method = self.model.current_method
+                def refresh_daily_data() -> None:
+                    ezan_saatleri = None
+                    takvim = None
+                    try:
+                        ezan_saatleri = self.model.ezan_saatlerini_hesapla(refresh_lat, refresh_lon, refresh_method)
+                        takvim = self.model.imsakiye_takvimini_al()
+                    except Exception as e:
+                        logging.exception("Günlük ezan saatleri yenilenirken hata: %s", e)
+                    def apply_daily_data() -> None:
+                        self._daily_refresh_in_progress = False
+                        if not (self.pencere and self.pencere.winfo_exists()):
+                            return
+                        if ((self.model.current_latitude, self.model.current_longitude) != (refresh_lat, refresh_lon)
+                                or self.model.current_method != refresh_method):
+                            logging.info("Günlük veriler hazırlanırken konum veya yöntem değişti; sonuç atlandı.")
+                            return
+                        if ezan_saatleri:
+                            self.current_ezan_saatleri = ezan_saatleri
+                            self.arayuzu_guncelle(ezan_saatleri)
+                        else:
+                            logging.error("Günlük ezan saatleri alınamadı; önceki veriler korunuyor.")
+                        if takvim:
+                            self.guncelle_takvim(takvim)
+                        else:
+                            logging.error("Günlük imsakiye takvimi alınamadı; önceki veriler korunuyor.")
+                    TkManager.safe_after(0, apply_daily_data, run_in_thread=False, context="DailyPrayerRefresh")
+                threading.Thread(target=refresh_daily_data, daemon=True).start()
+            try:
+                imsak_str = self.current_ezan_saatleri.get("fajr", "06:00")
+                iftar_str = self.current_ezan_saatleri.get("maghrib", "20:00")
+                imsak_time = datetime.combine(now.date(), datetime.strptime(imsak_str, "%H:%M").time(), tzinfo=tz)
+                iftar_time = datetime.combine(now.date(), datetime.strptime(iftar_str, "%H:%M").time(), tzinfo=tz)
+            except ValueError as ve:
+                self.controller.log_message(f"Zaman formatı hatası: {ve}. Varsayılan saatler kullanılacak.")
+                imsak_time = datetime.combine(now.date(), datetime.strptime("06:00", "%H:%M").time(), tzinfo=tz)
+                iftar_time = datetime.combine(now.date(), datetime.strptime("20:00", "%H:%M").time(), tzinfo=tz)
+            bir_onceki = iftar_time - timedelta(days=1)
+            fasting_duration = iftar_time - imsak_time
+            fasting_duration_str = format_duration(fasting_duration.total_seconds())
+            if now < imsak_time:
+                kalan = imsak_time - now
+                free_duration = imsak_time - bir_onceki
+                yuzde = ((now - bir_onceki).total_seconds() / max(free_duration.total_seconds(), 1.0)) * 100
+                self.sayac_label.config(text=f"Sahura Kalan Süre: {format_duration(kalan.total_seconds())}")
+                self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {format_duration(free_duration.total_seconds())}, %{format_percentage(yuzde)} tamamlandı")
+                self.yuzde_cubugu["value"] = clamp_percentage(yuzde)
+            elif now < iftar_time:
+                kalan = iftar_time - now
+                yuzde = ((now - imsak_time).total_seconds() / max(fasting_duration.total_seconds(), 1.0)) * 100
+                self.sayac_label.config(text=f"İftara Kalan Süre: {format_duration(kalan.total_seconds())}")
+                self.yuzde_etiket.config(text=f"Oruç süresi: {fasting_duration_str}, %{format_percentage(yuzde)} tamamlandı")
+                self.yuzde_cubugu["value"] = clamp_percentage(yuzde)
+            else:
+                next_imsak = imsak_time + timedelta(days=1)
+                kalan = next_imsak - now
+                free_duration = next_imsak - iftar_time
+                yuzde = ((now - iftar_time).total_seconds() / max(free_duration.total_seconds(), 1.0)) * 100
+                self.sayac_label.config(text=f"Sahura Kalan Süre: {format_duration(kalan.total_seconds())}")
+                self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {format_duration(free_duration.total_seconds())}, %{format_percentage(yuzde)} tamamlandı")
+                self.yuzde_cubugu["value"] = clamp_percentage(yuzde)
+        except Exception as e:
+            logging.exception("Geri sayım güncellenirken hata: %s", e)
+        finally:
             if self.pencere and self.pencere.winfo_exists():
                 try:
                     self._countdown_after_id = self.pencere.after(1000, self.update_countdown)
                 except tk.TclError:
                     self._countdown_after_id = None
-            return
-        tz_str = self.current_ezan_saatleri.get("timezone")
-        tz = get_timezone_from_str(tz_str)
-        now = get_utc_now().astimezone(tz)
-        try:
-            imsak_str = self.current_ezan_saatleri.get("fajr", "06:00")
-            iftar_str = self.current_ezan_saatleri.get("maghrib", "20:00")
-            imsak_time = datetime.combine(now.date(), datetime.strptime(imsak_str, "%H:%M").time(), tzinfo=tz)
-            iftar_time = datetime.combine(now.date(), datetime.strptime(iftar_str, "%H:%M").time(), tzinfo=tz)
-        except ValueError as ve:
-            self.controller.log_message(f"Zaman formatı hatası: {ve}. Varsayılan saatler kullanılacak.")
-            imsak_time = datetime.combine(now.date(), datetime.strptime("06:00", "%H:%M").time(), tzinfo=tz)
-            iftar_time = datetime.combine(now.date(), datetime.strptime("20:00", "%H:%M").time(), tzinfo=tz)
-        bir_onceki = iftar_time - timedelta(days=1)
-        fasting_duration = iftar_time - imsak_time
-        fasting_duration_str = f"{int(fasting_duration.total_seconds()//3600):02d}:{int((fasting_duration.total_seconds()%3600)//60):02d}"
-        if now < imsak_time:
-            kalan = imsak_time - now
-            kalan_str = str(kalan).split(".")[0]
-            free_duration = imsak_time - bir_onceki
-            free_str = f"{int(free_duration.total_seconds()//3600):02d}:{int((free_duration.total_seconds()%3600)//60):02d}"
-            toplam = (imsak_time - bir_onceki).total_seconds()
-            gecen = (now - bir_onceki).total_seconds()
-            yuzde = (gecen / toplam) * 100
-            self.sayac_label.config(text=f"Sahura Kalan Süre: {kalan_str}")
-            self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {free_str}, %{yuzde:.4f} tamamlandı")
-            self.yuzde_cubugu["value"] = yuzde
-        elif now < iftar_time:
-            kalan = iftar_time - now
-            kalan_str = str(iftar_time - now).split(".")[0]
-            toplam = (iftar_time - imsak_time).total_seconds()
-            gecen = (now - imsak_time).total_seconds()
-            yuzde = (gecen / toplam) * 100
-            self.sayac_label.config(text=f"İftara Kalan Süre: {kalan_str}")
-            self.yuzde_etiket.config(text=f"Oruç süresi: {fasting_duration_str}, %{yuzde:.4f} tamamlandı")
-            self.yuzde_cubugu["value"] = yuzde
-        else:
-            next_imsak = imsak_time + timedelta(days=1)
-            kalan = next_imsak - now
-            kalan_str = str(kalan).split(".")[0]
-            free_duration = next_imsak - iftar_time
-            free_str = f"{int(free_duration.total_seconds()//3600):02d}:{int((free_duration.total_seconds()%3600)//60):02d}"
-            toplam = free_duration.total_seconds()
-            gecen = (now - imsak_time).total_seconds() - (iftar_time - imsak_time).total_seconds()
-            yuzde = (gecen / toplam) * 100
-            self.sayac_label.config(text=f"Sahura Kalan Süre: {kalan_str}")
-            self.yuzde_etiket.config(text=f"Serbest yeme içme süresi: {free_str}, %{yuzde:.4f} tamamlandı")
-            self.yuzde_cubugu["value"] = yuzde
-        if self.pencere and self.pencere.winfo_exists():
             try:
-                self._countdown_after_id = self.pencere.after(1000, self.update_countdown)
-            except tk.TclError:
-                self._countdown_after_id = None
+                self.update_vakit_highlights()
+            except Exception as e:
+                logging.error("Vakit vurguları güncellenirken hata: %s", e)
 
     def update_vakit_highlights(self) -> None:
-        try:
-            if not (self.pencere and self.pencere.winfo_exists()):
-                return
-            if self.current_ezan_saatleri:
-                self.arayuzu_guncelle(self.current_ezan_saatleri)
-        except Exception as e:
-            logging.error(f"update_vakit_highlights hatası: {e}")
-        finally:
-            try:
-                if self.pencere and self.pencere.winfo_exists():
-                    TkManager.safe_after(1000, self.update_vakit_highlights, run_in_thread=False, context="UpdateVakitHighlights-Resched")
-            except Exception as e_resched:
-                logging.debug(f"update_vakit_highlights yeniden zamanlanamadı: {e_resched}")
+        if not (self.pencere and self.pencere.winfo_exists()):
+            return
+        if self.current_ezan_saatleri:
+            self.arayuzu_guncelle(self.current_ezan_saatleri)
     @run_on_main_thread
     def run_iftar_app(self) -> None:
         if TkManager.main_instance is None:
@@ -2188,6 +2353,7 @@ class IftarView:
             self.pencere = TkManager.main_instance
             logging.warning("Mevcut ana Tkinter penceresi yeniden kullanılıyor.")
         TkManager.main_instance = self.pencere
+        startup_action = self.model.consume_startup_location_action()
         self.pencere.after(50, TkManager.process_callback_queue)
         self.check_module_updates_var = tk.BooleanVar(master=self.pencere)
         current_val = self.model.config_manager.get("check_module_updates", "False")
@@ -2212,7 +2378,8 @@ class IftarView:
         self.pencere.geometry(pencere_boyutu)
         self.pencere.update_idletasks()
         TkManager.safe_after(100, self.controller.finalize_system_check, run_in_thread=False, context="FinalizeSystemCheck")
-        TkManager.safe_after(100, lambda: (self.pencere.bind("<F11>", self.toggle_fullscreen), self.pencere.bind("<Escape>", lambda e: self.pencere.attributes("-fullscreen", False))), run_in_thread=False, context="BindFullscreenKeys")
+        self.pencere.bind("<F11>", self.toggle_fullscreen)
+        self.pencere.bind("<Escape>", self.exit_fullscreen)
         self.pencere.minsize(650, 400)
         self.create_fonts(self.pencere)
         self.pencere.bind("<Configure>", self.on_configure)
@@ -2303,7 +2470,7 @@ class IftarView:
         self.dynamic_entry.bind("<Enter>", self.schedule_tooltip)
         self.dynamic_entry.bind("<Leave>", self.cancel_tooltip)
         self.dynamic_entry.bind("<ButtonRelease-1>", self.store_selection)
-        self.dynamic_entry.bind("<Button-3>", lambda event: (self.show_text_context_menu(event), "break"))
+        self.dynamic_entry.bind("<Button-3>", self.show_text_context_menu)
         self.dynamic_entry.bind("<Control-c>", lambda event: self.copy_text_from_widget(self.dynamic_entry))
         self.Aktif_Konum_Labeli_uygulama_sagligi_icinde_widget_V2()
         self.vakit_cerceve = ttk.Frame(self.pencere)
@@ -2331,8 +2498,8 @@ class IftarView:
                 self.arayuzu_guncelle(ezan_saatleri)
                 self.update_countdown()
             TkManager.safe_after(0, apply_times, run_in_thread=False, context="InitialPrayerTimes")
-        threading.Thread(target=fetch_initial_times, daemon=True).start()
-        TkManager.safe_after(1000, self.update_vakit_highlights, run_in_thread=False, context="UpdateVakitHighlights-Start")
+        if startup_action != "resolve":
+            threading.Thread(target=fetch_initial_times, daemon=True).start()
         iftar_sayaci_cerceve = ttk.Frame(self.pencere)
         iftar_sayaci_cerceve.pack(pady=10, padx=10, fill="x")
         iftar_sayaci_cerceve.columnconfigure(0, weight=1)
@@ -2362,57 +2529,8 @@ class IftarView:
             hicri_text = self.model.hicri_tarih_header()
             TkManager.safe_after(0, lambda: apply_hijri_header(hicri_text), run_in_thread=False, context="HijriHeader")
         threading.Thread(target=fetch_hijri_header, daemon=True).start()
-        def copy_label_text(event: tk.Event) -> None:
-            text = event.widget.cget("text")
-            self.pencere.clipboard_clear()
-            self.pencere.clipboard_append(text)
-            print("Kopyalandı:", text)
-        def show_context_menu(event: tk.Event) -> None:
-            widget = event.widget
-            menu = tk.Menu(self.pencere, tearoff=0)
-            try:
-                _ = widget.selection_get()
-                menu.add_command(label="Kopyala", command=lambda: copy_selection(widget))
-            except tk.TclError:
-                menu.add_command(label="Kopyala", state="disabled")
-            menu.tk_popup(event.x_root, event.y_root)
-        def copy_selection(widget: tk.Widget) -> None:
-            current_instance_id = id(widget)
-            current_widget_type = type(widget).__name__
-            log_prefix = f"[Patcher V2][Widget ID: {current_instance_id}, Type: {current_widget_type}]"
-            logging.debug(f"{log_prefix} local copy_selection başlatıldı.")
-            text_to_copy = ""
-            try:
-                text_to_copy = widget.selection_get()
-                logging.debug(f"{log_prefix} copy_selection: Selection found: '{text_to_copy}'")
-            except tk.TclError:
-                logging.warning(f"{log_prefix} copy_selection: selection_get() failed (No selection).")
-                text_to_copy = ""
-            except Exception as e:
-                logging.error(f"{log_prefix} copy_selection: Error getting selection: {e}", exc_info=True)
-                text_to_copy = ""
-            if text_to_copy:
-                try:
-                    logging.info(f"{log_prefix} copy_selection: Attempting to copy: '{text_to_copy}'")
-                    widget.clipboard_clear()
-                    widget.clipboard_append(text_to_copy)
-                    logging.info(f"{log_prefix} copy_selection: Kopyalandı: {text_to_copy}")
-                    try:
-                        clipboard_after = widget.clipboard_get()
-                        if clipboard_after == text_to_copy:
-                            logging.info(f"{log_prefix} copy_selection: Clipboard verification PASSED.")
-                        else:
-                            logging.error(f"{log_prefix} copy_selection: !! Clipboard verification FAILED !! Expected: '{text_to_copy}', Got: '{clipboard_after}'")
-                    except Exception as e_verify:
-                        logging.warning(f"{log_prefix} copy_selection: Clipboard verification check failed: {e_verify}")
-                except Exception as e_clip:
-                     logging.error(f"{log_prefix} copy_selection: Clipboard operation failed: {e_clip}", exc_info=True)
-                     print(f"HATA: Panoya kopyalarken hata oluştu: {e_clip}")
-            else:
-                 logging.warning(f"{log_prefix} copy_selection: No text selected to copy (selection failed/empty or Label empty/error).")
-
-        imsak_takvimi_baslik.bind("<Button-3>", show_context_menu)
-        imsak_takvimi_baslik.bind("<Control-c>", lambda event: copy_selection(imsak_takvimi_baslik))
+        imsak_takvimi_baslik.bind("<Button-3>", self.show_text_context_menu)
+        imsak_takvimi_baslik.bind("<Control-c>", lambda event: self.copy_text_from_widget(imsak_takvimi_baslik))
         tablo_cerceve = ttk.Frame(self.pencere)
         tablo_cerceve.pack(pady=10, padx=10, fill="both", expand=True)
         icerik_frame = ttk.Frame(tablo_cerceve)
@@ -2437,26 +2555,11 @@ class IftarView:
             if not imsakiye:
                 return
             TkManager.safe_after(0, lambda: self.guncelle_takvim(imsakiye), run_in_thread=False, context="InitialImsakiye")
-        threading.Thread(target=fetch_initial_calendar, daemon=True).start()
-        context_menu = tk.Menu(self.pencere, tearoff=0)
-        context_menu.add_command(label="Kopyala", command=lambda: self.copy_treeview_selection(tree))
-        def show_context_menu_tree(event: tk.Event) -> None:
-            iid = tree.identify_row(event.y)
-            if iid:
-                tree.selection_set(iid)
-                context_menu.tk_popup(event.x_root, event.y_root)
-            context_menu.grab_release()
-        tree.bind("<Button-3>", show_context_menu_tree)
+        if startup_action != "resolve":
+            threading.Thread(target=fetch_initial_calendar, daemon=True).start()
+        tree.bind("<Button-3>", lambda event: self.show_tree_context_menu(event, tree))
         tree.bind("<Control-c>", lambda event: self.copy_treeview_selection(tree))
         tree.bind("<Button-1>", lambda e: "break" if tree.identify_region(e.x, e.y) == "separator" else None)
-        def update_tree_columns():
-            new_width = int(tree.winfo_width() / len(columns))
-            for col in columns:
-                tree.column(col, width=new_width)
-        def on_resize(event: tk.Event) -> None:
-            if hasattr(tree, '_resize_job'):
-                tree.after_cancel(tree._resize_job)
-            tree._resize_job = tree.after(150, update_tree_columns)
         console_frame = ttk.Frame(self.pencere)
         self.console_frame = console_frame
         if self.model.DEVELOPER_MODE:
@@ -2487,16 +2590,16 @@ class IftarView:
         self.ConsolePanel.tag_configure("INFO", foreground="#00A000")
         self.ConsolePanel.tag_configure("DEBUG", foreground="cyan")
         self.ConsolePanel.tag_configure("DEFAULT", foreground="green")
-        self.ConsolePanel.bind("<Button-3>", self.log_text_context_menu)
-        self.ConsolePanel.bind("<Control-a>", lambda event: (self.ConsolePanel.tag_add("sel", "1.0", "end"), "break"))
-        def on_console_key(e: tk.Event) -> str:
-            if e.keysym == 'F4' and (e.state & 0x8): 
-                on_closing()
-                return "break" 
-            elif (e.state & 0x4) and e.keysym.lower() == "c": 
+        def select_all_console(event: tk.Event) -> str:
+            self.ConsolePanel.tag_add("sel", "1.0", "end")
+            return "break"
+        self.ConsolePanel.bind("<Button-3>", lambda event: self.show_text_context_menu(event, self.ConsolePanel))
+        self.ConsolePanel.bind("<Control-a>", select_all_console)
+        def on_console_key(e: tk.Event) -> Optional[str]:
+            if (e.state & 0x4) and e.keysym.lower() == "c":
                 self.copy_text_from_widget(self.ConsolePanel)
                 return "break"
-            return None 
+            return None
         self.ConsolePanel.bind("<Key>", on_console_key)
         cmd_frame = ttk.Frame(console_frame)
         cmd_frame.pack(side="bottom", fill="x", padx=0, pady=0)
@@ -2527,8 +2630,11 @@ class IftarView:
         command_entry.grid(row=0, column=1, padx=(2, 5), pady=2, sticky="ew")
         cmd_frame.columnconfigure(1, weight=1)
         command_entry.bind("<Return>", execute_command_entry)
-        command_entry.bind("<Control-a>", lambda event: (command_entry.select_range(0, tk.END),
-                                                         command_entry.icursor(tk.END), "break"))
+        def select_all_command_entry(event: tk.Event) -> str:
+            command_entry.select_range(0, tk.END)
+            command_entry.icursor(tk.END)
+            return "break"
+        command_entry.bind("<Control-a>", select_all_command_entry)
         def pencere_kapat() -> None:
             try:
                 try:
@@ -2589,7 +2695,6 @@ class IftarView:
             if safe_askyesno("Çıkış", "Uygulamadan çıkmak istediğinize emin misiniz?"):
                 pencere_kapat()
         self.pencere.protocol("WM_DELETE_WINDOW", on_closing)
-        self.pencere.bind("<Alt-F4>", lambda event: on_closing())
         def periodic_console_update(update_context: str = "PeriodicConsoleUpdate") -> None:
             try:
                 if self.pencere and self.pencere.winfo_exists():
@@ -2605,19 +2710,11 @@ class IftarView:
                  logging.debug("Periodic console update rescheduling stopped as window no longer exists.")
         TkManager.safe_after(500, periodic_console_update, run_in_thread=False, context="InitialConsoleUpdate")
         self.pencere.deiconify()
-        if getattr(self.model, "_auto_locate_on_start", False):
-            self.model._auto_locate_on_start = False
+        if startup_action == "resolve":
+            TkManager.safe_after(300, lambda: self.controller.konum_guncelle(notify=False, resolve_text=True), run_in_thread=False, context="InitialSavedLocation")
+        elif startup_action == "auto":
             TkManager.safe_after(300, lambda: self.controller.konum_guncelle(notify=False), run_in_thread=False, context="InitialAutoLocation")
         self.pencere.mainloop()
-    @run_on_main_thread
-    def cleanup(self) -> None:
-        try:
-            self.model.executor.shutdown(wait=True)
-            self.model.GLOBAL_SESSION.close()
-            if self.pencere:
-                self.pencere.destroy()
-        except Exception as e:
-            logging.error(f"Temizleme sırasında sorun: {e}")
     @run_on_main_thread
     def on_configure(self, event: tk.Event) -> None:
         current_time = time.time()
@@ -2675,7 +2772,6 @@ class IftarView:
         self.default_font = tkFont.Font(root, family="Segoe UI Emoji", size=10)
         self.bold_font = tkFont.Font(root, family="Segoe UI Emoji", size=10, weight="bold")
         self.large_bold_font = tkFont.Font(root, family="Segoe UI Emoji", size=14, weight="bold")
-        self.button_font = tkFont.Font(root, family="Segoe UI Emoji", size=10)
     @run_on_main_thread
     def arayuzu_guncelle(self, ezan_saatleri: Dict[str, str]) -> None:
         if self.prayer_labels is None or self.prayer_time_labels is None:
@@ -2826,16 +2922,6 @@ class IftarView:
     @run_on_main_thread
     def show_error(self, title: str, msg: str) -> None:
         safe_showerror(title, msg)
-    def ask_string(self, title: str, prompt: str) -> Optional[str]:
-        input_str = safe_askstring(title, prompt)
-        if input_str is not None:
-            MAX_LEN = 3
-            if len(input_str) > MAX_LEN:
-                logging.warning("Kullanıcı girdisi %d karakteri aştı, ilk %d karakter alınıyor.", len(input_str), MAX_LEN)
-                return input_str[:MAX_LEN].strip()
-            else:
-                 return input_str.strip()
-        return None
     @run_on_main_thread
     def update_console_from_model(self, max_lines: int = 1000) -> None:
         try:
@@ -2931,55 +3017,32 @@ class IftarView:
             self._custom_tbutton_style_done = True
         kwargs["style"] = style_name
         return ttk.Button(master, **kwargs)
-    @staticmethod
-    def on_text_click(event: tk.Event) -> None:
-        try:
-            if event.widget.tag_ranges("sel"):
-                event.widget.tag_remove("sel", "1.0", "end")
-        except tk.TclError:
-            pass
     def copy_treeview_selection(self, tree_widget: ttk.Treeview) -> None:
-        instance_id = id(tree_widget)
-        log_prefix = f"[Patcher V2][Widget ID: {instance_id}, Type: Treeview]"
-        logging.debug(f"{log_prefix} copy_treeview_selection başlatıldı.")
         selected_items = tree_widget.selection()
-        if selected_items:
-            lines = []
-            for item in selected_items:
-                try:
-                    row_values = tree_widget.item(item, "values")
-                    lines.append("\t".join(map(str, row_values)))
-                except Exception as e_item:
-                    logging.error(f"{log_prefix} Error getting item '{item}' values: {e_item}")
-            final_text_to_copy = "\n".join(lines)
-            if final_text_to_copy:
-                try:
-                    logging.info(f"{log_prefix} Attempting to copy to clipboard: '{final_text_to_copy}'")
-                    tree_widget.master.clipboard_clear()
-                    tree_widget.master.clipboard_append(final_text_to_copy)
-                    logging.info(f"{log_prefix} Kopyalandı: {final_text_to_copy}")
-                    try:
-                        clipboard_after = tree_widget.master.clipboard_get()
-                        if clipboard_after == final_text_to_copy:
-                            logging.info(f"{log_prefix} Clipboard verification PASSED.")
-                        else:
-                            logging.error(f"{log_prefix} !! Clipboard verification FAILED !! Expected: '{final_text_to_copy}', Got: '{clipboard_after}'")
-                    except Exception as e_verify:
-                        logging.warning(f"{log_prefix} Clipboard verification check failed: {e_verify}")
-
-                except Exception as e_clip:
-                    logging.error(f"{log_prefix} Clipboard operation failed: {e_clip}", exc_info=True)
-                    safe_showerror("Kopyalama Hatası", f"Treeview verisi panoya kopyalanamadı:\n{e_clip}")
-            else:
-                logging.warning(f"{log_prefix} No valid text generated from selected Treeview items.")
-        else:
-            logging.warning(f"{log_prefix} No items selected in Treeview.")
-
-    def log_text_context_menu(self, event: tk.Event) -> None:
-        menu = tk.Menu(self.ConsolePanel, tearoff=0)
-        menu.add_command(label="Kopyala", command=lambda: self.copy_text_from_widget(self.ConsolePanel))
-        menu.tk_popup(event.x_root, event.y_root)
-        menu.grab_release()
+        if not selected_items:
+            logging.info("Panoya kopyalanacak satır seçilmedi (kaynak: Treeview).")
+            return
+        lines = []
+        for item in selected_items:
+            try:
+                row_values = tree_widget.item(item, "values")
+                lines.append("\t".join(map(str, row_values)))
+            except Exception as e_item:
+                logging.error("Treeview satırı okunamadı: %s", e_item)
+        text_to_copy = "\n".join(lines)
+        if not text_to_copy:
+            logging.info("Seçili Treeview satırlarından metin üretilemedi.")
+            return
+        try:
+            tree_widget.master.clipboard_clear()
+            tree_widget.master.clipboard_append(text_to_copy)
+            logging.info(
+                "Panoya %d karakter kopyalandı (kaynak: Treeview, satır: %d).",
+                len(text_to_copy), len(lines)
+            )
+        except tk.TclError as e:
+            logging.exception("Treeview verisi panoya kopyalanamadı: %s", e)
+            safe_showerror("Kopyalama Hatası", f"Treeview verisi panoya kopyalanamadı:\n{e}")
     @run_on_main_thread
     def update_sistem_saati_label(self, icon: str, msg: str) -> None:
         if self.sistem_saati_label:
@@ -2987,112 +3050,130 @@ class IftarView:
 
 _SHUTDOWN_LOCK = threading.Lock()
 _SHUTDOWN_DONE = False
+_SHUTDOWN_IN_PROGRESS = False
 
 def graceful_shutdown(exit_process: bool = False):
-    global _SHUTDOWN_DONE
+    global _SHUTDOWN_DONE, _SHUTDOWN_IN_PROGRESS
     with _SHUTDOWN_LOCK:
         if _SHUTDOWN_DONE:
             logging.info("Kapanış zaten tamamlandı.")
             return
-        _SHUTDOWN_DONE = True
+        if _SHUTDOWN_IN_PROGRESS:
+            logging.warning("Kapanış zaten devam ediyor; yeni istek yok sayıldı.")
+            return
+        _SHUTDOWN_IN_PROGRESS = True
     SHUTDOWN_JOIN_TIMEOUT = 5
     resources_closed = True
-
+    completed = False
     try:
-        model._cleanup_async_loop()
-        logging.info(f"{datetime.now()} - Async loop kapatıldı.")
-    except Exception as e:
-        logging.error(f"{datetime.now()} - Async loop kapatılırken hata oluştu: {e}")
-        resources_closed = False
-    try:
-        if model.executor:
-            model.executor.shutdown(wait=False, cancel_futures=True)
-            logging.info(f"{datetime.now()} - Thread havuzu kapatma isteği gönderildi.")
-            start_time = time.time()
-            while not model.executor._shutdown and time.time() - start_time < SHUTDOWN_JOIN_TIMEOUT:
-                time.sleep(0.1)
-            if not model.executor._shutdown:
-                logging.error("Thread havuzu kapanmadı, zorla sonlandırılıyor.")
-                resources_closed = False
-            else:
-                logging.info(f"{datetime.now()} - Thread havuzu başarıyla kapatıldı.")
-    except Exception as e:
-        logging.error(f"{datetime.now()} - Thread havuzu kapanırken hata oluştu: {e}")
-        resources_closed = False
-    try:
-        if model.GLOBAL_SESSION:
-            model.GLOBAL_SESSION.close()
-            logging.info(f"{datetime.now()} - HTTP oturumu başarıyla kapatıldı.")
-    except Exception as e:
-        logging.error(f"{datetime.now()} - HTTP oturumu kapatılırken hata oluştu: {e}")
-        resources_closed = False
-    try:
-        if view.pencere is not None:
-            try:
-                exists = view.pencere.winfo_exists()
-            except Exception:
-                exists = False
-            if exists:
-                view.pencere.destroy()
-                logging.info(f"{datetime.now()} - Tkinter penceresi kapatıldı.")
-    except Exception as e:
-        logging.error(f"{datetime.now()} - Tkinter penceresi kapatılırken hata oluştu: {e}")
-        resources_closed = False
-    remaining_threads = []
-    join_deadline = time.time() + SHUTDOWN_JOIN_TIMEOUT
-    for thread in threading.enumerate():
-        if thread is not threading.main_thread() and not thread.daemon:
-            remaining = join_deadline - time.time()
-            if remaining <= 0:
-                remaining_threads.append(thread.name)
-                resources_closed = False
-                continue
-            try:
-                logging.info(f"{datetime.now()} - Thread {thread.name} için join bekleniyor.")
-                thread.join(timeout=remaining)
-                if thread.is_alive():
-                    logging.error(f"{datetime.now()} - Thread {thread.name} kapatılamadı.")
-                    remaining_threads.append(thread.name)
+        try:
+            model._cleanup_async_loop()
+            logging.info(f"{datetime.now()} - Async loop kapatıldı.")
+        except Exception as e:
+            logging.error(f"{datetime.now()} - Async loop kapatılırken hata oluştu: {e}")
+            resources_closed = False
+        try:
+            if model.executor:
+                model.executor.shutdown(wait=False, cancel_futures=True)
+                logging.info(f"{datetime.now()} - Thread havuzu kapatma isteği gönderildi.")
+                start_time = time.time()
+                while not model.executor._shutdown and time.time() - start_time < SHUTDOWN_JOIN_TIMEOUT:
+                    time.sleep(0.1)
+                if not model.executor._shutdown:
+                    logging.error("Thread havuzu kapanmadı, zorla sonlandırılıyor.")
                     resources_closed = False
                 else:
-                    logging.info(f"{datetime.now()} - Thread {thread.name} sonlandı.")
-            except Exception as e:
-                logging.error(f"{datetime.now()} - Thread {thread.name} kapanırken hata oluştu: {e}")
-                resources_closed = False
-    if remaining_threads:
-        logging.warning(f"{datetime.now()} - Sonlandırılamayan threadler: {', '.join(remaining_threads)}")
-    
-    if resources_closed:
-        logging.info(f"{datetime.now()} - Tüm kaynaklar başarıyla kapatıldı.")
-    else:
-        logging.warning(f"{datetime.now()} - Bazı kaynaklar düzgün kapatılamadı. Detaylar için log dosyasını kontrol edin.")
-    logging.info(f"{datetime.now()} - Graceful shutdown tamamlandı.")
-    listener = getattr(model, 'log_queue_listener', None)
-    if listener:
-        logging.info(f"{datetime.now()} - Günlük dinleyicisi kapatılıyor.")
-        try:
-            listener.stop()
+                    logging.info(f"{datetime.now()} - Thread havuzu başarıyla kapatıldı.")
         except Exception as e:
+            logging.error(f"{datetime.now()} - Thread havuzu kapanırken hata oluştu: {e}")
+            resources_closed = False
+        try:
+            if model.GLOBAL_SESSION:
+                model.GLOBAL_SESSION.close()
+                logging.info(f"{datetime.now()} - HTTP oturumu başarıyla kapatıldı.")
+        except Exception as e:
+            logging.error(f"{datetime.now()} - HTTP oturumu kapatılırken hata oluştu: {e}")
+            resources_closed = False
+        try:
+            if view.pencere is not None:
+                try:
+                    exists = view.pencere.winfo_exists()
+                except Exception:
+                    exists = False
+                if exists:
+                    view.pencere.destroy()
+                    logging.info(f"{datetime.now()} - Tkinter penceresi kapatıldı.")
+        except Exception as e:
+            logging.error(f"{datetime.now()} - Tkinter penceresi kapatılırken hata oluştu: {e}")
+            resources_closed = False
+        remaining_threads = []
+        join_deadline = time.time() + SHUTDOWN_JOIN_TIMEOUT
+        for thread in threading.enumerate():
+            if thread is not threading.main_thread() and not thread.daemon:
+                remaining = join_deadline - time.time()
+                if remaining <= 0:
+                    remaining_threads.append(thread.name)
+                    resources_closed = False
+                    continue
+                try:
+                    logging.info(f"{datetime.now()} - Thread {thread.name} için join bekleniyor.")
+                    thread.join(timeout=remaining)
+                    if thread.is_alive():
+                        logging.error(f"{datetime.now()} - Thread {thread.name} kapatılamadı.")
+                        remaining_threads.append(thread.name)
+                        resources_closed = False
+                    else:
+                        logging.info(f"{datetime.now()} - Thread {thread.name} sonlandı.")
+                except Exception as e:
+                    logging.error(f"{datetime.now()} - Thread {thread.name} kapanırken hata oluştu: {e}")
+                    resources_closed = False
+        if remaining_threads:
+            logging.warning(f"{datetime.now()} - Sonlandırılamayan threadler: {', '.join(remaining_threads)}")
+        listener = getattr(model, 'log_queue_listener', None)
+        if listener:
+            logging.info(f"{datetime.now()} - Günlük dinleyicisi kapatılıyor.")
+            try:
+                listener.stop()
+            except Exception as e:
+                resources_closed = False
+                try:
+                    with open(model.LOG_FILE, "a", encoding="utf-8") as log_file:
+                        log_file.write(f"{datetime.now()} - ERROR - Günlük dinleyicisi kapatılırken hata oluştu: {e}\n")
+                except OSError:
+                    pass
+            finally:
+                for handler in getattr(listener, 'handlers', []):
+                    try:
+                        handler.flush()
+                        handler.close()
+                    except Exception:
+                        resources_closed = False
+                model.log_queue_listener = None
+        if resources_closed:
+            final_messages = [("INFO", "Tüm kaynaklar başarıyla kapatıldı."), ("INFO", "Graceful shutdown tamamlandı.")]
+        else:
+            final_messages = [("WARNING", "Bazı kaynaklar düzgün kapatılamadı. Detaylar için log dosyasını kontrol edin."), ("INFO", "Graceful shutdown tamamlandı.")]
+        if listener:
             try:
                 with open(model.LOG_FILE, "a", encoding="utf-8") as log_file:
-                    log_file.write(f"{datetime.now()} - ERROR - Günlük dinleyicisi kapatılırken hata oluştu: {e}\n")
+                    for level_name, message in final_messages:
+                        log_file.write(f"{datetime.now()} - {level_name} - {message}\n")
             except OSError:
                 pass
-        finally:
-            for handler in getattr(listener, 'handlers', []):
-                try:
-                    handler.flush()
-                    handler.close()
-                except Exception:
-                    pass
-            model.log_queue_listener = None
+        else:
+            for level_name, message in final_messages:
+                logging.log(getattr(logging, level_name), message)
+        completed = resources_closed
+    finally:
+        with _SHUTDOWN_LOCK:
+            _SHUTDOWN_IN_PROGRESS = False
+            if completed:
+                _SHUTDOWN_DONE = True
     if exit_process:
         sys.exit(0)
 
 if __name__ == "__main__":
-    base_dir = os.getcwd()
-    if not os.path.exists(base_dir):
-        os.makedirs(base_dir, exist_ok=True)
+    base_dir = get_base_dir()
     model = IftarModel(base_dir=base_dir, default_timeout=10, short_timeout=5, default_retries=3, backoff_factor=2)
     DEVELOPER_MODE = (model.config_manager.get("DEVELOPER_MODE", "False").lower() == "true")
     CHECK_MODULE_UPDATES = (model.config_manager.get("check_module_updates", "False").lower() == "true")
