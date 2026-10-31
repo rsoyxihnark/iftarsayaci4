@@ -36,6 +36,8 @@ jobs:
       - name: Check the commit
         id: gate
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
           $source = Get-Content -Raw -Encoding UTF8 "iftar sayacı.py"
@@ -62,10 +64,10 @@ jobs:
           if (-not $changelogChanged) { throw "A version commit must update CHANGELOG.md." }
           $changelog = Get-Content -Raw -Encoding UTF8 "CHANGELOG.md"
           if ($changelog -notmatch "(?m)^## \[$([regex]::Escape($version))\]\r?$") { throw "CHANGELOG.md has no section for $version." }
-          git ls-remote --exit-code --tags origin "refs/tags/$version" 2>$null | Out-Null
-          $tagExit = $LASTEXITCODE
-          if ($tagExit -eq 0) { throw "Version $version has already been published." }
-          if ($tagExit -ne 2) { throw "Could not check whether $version is already published (git exit $tagExit)." }
+          $releaseJson = gh release list --repo $env:GITHUB_REPOSITORY --limit 1000 --json tagName
+          if ($LASTEXITCODE -ne 0) { throw "Could not check whether $version is already published." }
+          $releases = @($releaseJson | ConvertFrom-Json)
+          if (@($releases | Where-Object { $_.tagName -eq $version }).Count -gt 0) { throw "Version $version has already been published." }
           "release=true" >> $env:GITHUB_OUTPUT
           exit 0
 
@@ -205,3 +207,4 @@ jobs:
           $ErrorActionPreference = "Stop"
           $exe = "dist/IftarSayaci.exe"
           gh release create $env:VERSION $exe --title "Iftar Sayaci $($env:VERSION)" --notes-file release-notes.md --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed." }
