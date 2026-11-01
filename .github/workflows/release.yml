@@ -82,6 +82,7 @@ jobs:
       - name: Check the text rules
         shell: python
         run: |
+          import ast
           import subprocess
           import tokenize
           from pathlib import Path
@@ -105,6 +106,11 @@ jobs:
               for token in tokenize.tokenize(handle.readline):
                   if token.type in (tokenize.COMMENT, tokenize.STRING) and len(token.string) > 248:
                       failures.append(f"iftar sayacı.py:{token.start[0]}: text longer than 248 characters")
+
+          source = Path("iftar sayacı.py").read_text(encoding="utf-8")
+          for node in ast.walk(ast.parse(source)):
+              if isinstance(node, ast.JoinedStr) and len(ast.get_source_segment(source, node) or "") > 248:
+                  failures.append(f"iftar sayacı.py:{node.lineno}: text longer than 248 characters")
 
           body = subprocess.run(["git", "log", "-1", "--pretty=%b"], capture_output=True, text=True, encoding="utf-8").stdout
           for number, line in enumerate(body.splitlines(), 1):

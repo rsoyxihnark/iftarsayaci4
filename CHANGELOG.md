@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.5]
+
+- Fixed the window sometimes reopening a little away from where you last moved it.
+- Fixed Temizle flashing a black command window in the packaged app.
+- Fixed the packaged app holding a copy of every log line in memory for as long as it runs.
+- Fixed the Hijri date above the imsak calendar and the Ramadan greeting not updating for the new day.
+- Fixed the Geliştirici Modu command line rejecting arithmetic and comparisons such as 1 + 2.
+- Fixed activity.log labelling the next month's imsak calendar request as the current month.
+- Fixed Tkinter errors being written to activity.log twice.
+- Fixed an unreadable Yatsı time filling activity.log with the same error every second before İmsak.
+- The app no longer starts an extra thread for every window update.
+- Removed unused helpers, duplicate imports, code comments, and unreachable code.
+
 ## [1.0.4]
 
 - Fixed the packaged app trying to install a missing library by launching itself instead of showing an error.

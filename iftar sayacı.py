@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# ---------------------------------------------------------------------
-# Minimal Temel İthalatlar (modüle manager için)
-# ---------------------------------------------------------------------
 import ast as ast_mod
 import os
 import sys
@@ -25,10 +21,10 @@ import tkinter.font as tkFont
 import tkinter.ttk as ttk
 from datetime import datetime, timedelta, timezone, tzinfo
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 import concurrent.futures
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -75,9 +71,6 @@ def get_check_module_updates_from_settings() -> bool:
 CHECK_MODULE_UPDATES = get_check_module_updates_from_settings()
 _LOGGING_CONFIGURED = False
 
-# ---------------------------------------------------------------------
-# ModuleManager: Tüm üçüncü taraf kütüphane import ve kurulumu bu sınıf tarafından yönetilir.
-# ---------------------------------------------------------------------
 class ModuleManager:
     VALID_PACKAGE_REGEX = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*(?:[.-][a-zA-Z0-9_]+)*$")
 
@@ -216,9 +209,6 @@ def get_module_version(mod: Any, package_name: Optional[str] = None) -> str:
         return "builtin"
     return getattr(mod, "__version__", "unknown")
 
-# ---------------------------------------------------------------------
-# Gerekli modüllerin tanımlandığı liste
-# ---------------------------------------------------------------------
 required_modules: List[ModuleManager.ModuleInfo] = [
     ModuleManager.ModuleInfo("babel", "babel", "2.18.0"),
     ModuleManager.ModuleInfo("certifi", "certifi", "2026.10.23"),
@@ -232,128 +222,52 @@ required_modules: List[ModuleManager.ModuleInfo] = [
     ModuleManager.ModuleInfo("dotenv", "python-dotenv", "1.2.4"),
 ]
 
-# ---------------------------------------------------------------------
-# Global dinamik importlar
-# ---------------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     ModuleManager.ensure_required_modules(required_modules)
 
-ast_mod = ModuleManager.dynamic_import("ast")
 asyncio = ModuleManager.dynamic_import("asyncio")
 babel = ModuleManager.dynamic_import("babel")
 babel_dates = ModuleManager.dynamic_import("babel.dates")
-concurrent_futures = ModuleManager.dynamic_import("concurrent.futures")
-configparser = ModuleManager.dynamic_import("configparser")
-datetime_mod = ModuleManager.dynamic_import("datetime")
-datetime = datetime_mod.datetime
-timedelta = datetime_mod.timedelta
-timezone = datetime_mod.timezone
 geopy = ModuleManager.dynamic_import("geopy")
 hijridate = ModuleManager.dynamic_import("hijridate")
 locale = ModuleManager.dynamic_import("locale")
 messagebox = ModuleManager.dynamic_import("tkinter.messagebox")
 ntplib = ModuleManager.dynamic_import("ntplib")
 pycountry = ModuleManager.dynamic_import("pycountry")
-queue = ModuleManager.dynamic_import("queue")
 random = ModuleManager.dynamic_import("random")
 requests = ModuleManager.dynamic_import("requests")
 rich_logging = ModuleManager.dynamic_import("rich.logging")
 signal_mod = ModuleManager.dynamic_import("signal")
-simpledialog = ModuleManager.dynamic_import("tkinter.simpledialog")
-tk = ModuleManager.dynamic_import("tkinter")
-tkFont = ModuleManager.dynamic_import("tkinter.font")
-ttk = ModuleManager.dynamic_import("tkinter.ttk")
-types_mod = ModuleManager.dynamic_import("types")
 unicodedata = ModuleManager.dynamic_import("unicodedata")
 urllib_parse = ModuleManager.dynamic_import("urllib.parse")
 zoneinfo = ModuleManager.dynamic_import("zoneinfo")
 dotenv = ModuleManager.dynamic_import("dotenv")
 dotenv.load_dotenv()
 
-# ---------------------------------------------------------------------
-# TkManager Sınıfı: Ana Tkinter örneğini merkezi olarak saklamak için
-# ---------------------------------------------------------------------
 class TkManager:
     main_instance: Optional[tk.Tk] = None
     _callback_queue = queue.Queue()
 
     @staticmethod
-    def safe_after(delay: int, callback: Callable, *args, timeout: float = 10, run_in_thread: bool = False, context: str = "Unknown", **kwargs) -> Optional[str]:
+    def safe_after(delay: int, callback: Callable, *args, context: str = "Unknown", **kwargs) -> Optional[str]:
         if TkManager.main_instance is None:
             logging.error(f"({context}) Main TK instance'ı mevcut değil (safe_after).")
             return None
         if threading.current_thread() is not threading.main_thread():
-            cb_repr = repr(callback)
-            logging.debug(f"safe_after: Queuing callback {cb_repr} [Context: {context}] from background thread {threading.get_ident()}")
             ready_at = time.monotonic() + max(delay, 0) / 1000
             TkManager._callback_queue.put((ready_at, callback, args, kwargs))
             return f"queued-{time.monotonic_ns()}"
-        cb_repr = repr(callback)
-        if run_in_thread:
-            logging.debug(f"safe_after: Scheduling callback {cb_repr} [Context: {context}] with delay {delay}ms to run in a background thread.")
-        else:
-            logging.debug(f"safe_after: Scheduling callback {cb_repr} [Context: {context}] with delay {delay}ms to run directly in main thread.")
-
-        event = threading.Event()
-        after_id = None
-
         def wrapper():
-            nonlocal after_id
-            log_prefix = f"safe_after wrapper (cb={cb_repr}, id={after_id}, context={context}):"
-            logging.debug(f"{log_prefix} Starting execution (run_in_thread={run_in_thread}).")
-            start_time = time.monotonic()
-            if run_in_thread:
-                def thread_func():
-                    bg_log_prefix = f"{log_prefix} Background thread {threading.get_ident()}:"
-                    try:
-                        logging.debug(f"{bg_log_prefix} Starting work.")
-                        callback(*args, **kwargs)
-                        logging.debug(f"{bg_log_prefix} Finished work.")
-                    except Exception as e_bg_cb:
-                        logging.error(f"{bg_log_prefix} Exception during execution: {e_bg_cb}", exc_info=True)
-                    finally:
-                        event.set()
-                threading.Thread(target=thread_func, daemon=True).start()
-            else:
-                try:
-                    callback(*args, **kwargs)
-                except Exception as e_cb:
-                    logging.error(f"{log_prefix} Exception during callback execution: {e_cb}", exc_info=True)
-                finally:
-                    end_time = time.monotonic()
-                    duration = end_time - start_time
-                    logging.debug(f"{log_prefix} Finished execution (duration: {duration:.4f}s). Setting event.")
-                    event.set()
+            try:
+                callback(*args, **kwargs)
+            except Exception as e_cb:
+                logging.error(f"safe_after ({context}): Exception during callback execution: {e_cb}", exc_info=True)
         try:
-            after_id = TkManager.main_instance.after(delay, wrapper)
-            logging.debug(f"safe_after: Scheduled {cb_repr} [Context: {context}] with after_id {after_id}")
+            return TkManager.main_instance.after(delay, wrapper)
         except Exception as e_schedule:
-            logging.error(f"safe_after: FAILED to schedule callback {cb_repr} [Context: {context}]. Error: {e_schedule}", exc_info=True)
+            logging.error(f"safe_after: FAILED to schedule callback [Context: {context}]. Error: {e_schedule}", exc_info=True)
             return None
-
-        def watchdog():
-            log_prefix_wd = f"safe_after watchdog (cb={cb_repr}, id={after_id}, context={context}):"
-            logging.debug(f"{log_prefix_wd} Starting wait (timeout={timeout}s).")
-            if not event.wait(timeout):
-                logging.error(f"{log_prefix_wd} TIMEOUT! Callback did not complete in {timeout}s.")
-                def cancel_callback():
-                    log_prefix_cancel = f"safe_after watchdog cancel (cb={cb_repr}, id={after_id}, context={context}):"
-                    try:
-                        if TkManager.main_instance and TkManager.main_instance.winfo_exists():
-                            TkManager.main_instance.after_cancel(after_id)
-                            logging.info(f"{log_prefix_cancel} Callback cancelled via after_cancel.")
-                        else:
-                            logging.warning(f"{log_prefix_cancel} Cancellation skipped, main window doesn't exist.")
-                    except tk.TclError as e_cancel:
-                        logging.warning(f"{log_prefix_cancel} after_cancel failed (normal if callback finished just before cancel): {e_cancel}")
-                    except Exception as e_generic_cancel:
-                        logging.error(f"{log_prefix_cancel} Error during cancellation: {e_generic_cancel}", exc_info=True)
-                TkManager.safe_after(0, cancel_callback, context=f"Cancel-{context}-{after_id}", run_in_thread=False)
-            else:
-                logging.debug(f"{log_prefix_wd} Event received, callback completed within timeout.")
-        threading.Thread(target=watchdog, daemon=True).start()
-        return after_id
     @staticmethod
     def process_callback_queue():
         now = time.monotonic()
@@ -390,46 +304,24 @@ class TkManager:
         else:
             logging.debug("process_callback_queue: Ana pencere yok, tekrar zamanlanmıyor.")
 
-# ---------------------------------------------------------------------
-# Dekoratörler: run_on_main_thread_global ve run_on_main_thread
-# ---------------------------------------------------------------------
 def run_on_main_thread_global(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any):
         if threading.current_thread() is threading.main_thread():
             return func(*args, **kwargs)
-        else:
-            if TkManager.main_instance is not None:
-                result_container = []
-                error_container = [] 
-                event = threading.Event()
-                def task():
-                    try:
-                        result_container.append(safe_invoke(func, *args, **kwargs))
-                    except Exception as e_task:
-                         error_container.append(e_task)
-                         logging.error("Exception in task scheduled by run_on_main_thread_global for %s: %s", func.__name__, e_task, exc_info=True)
-                    finally:
-                        event.set() 
-                schedule_success = TkManager.safe_after(
-                    0,
-                    task,
-                    run_in_thread=False, 
-                    context=f"run_on_main_thread_global:{func.__name__}"
-                )
-                if schedule_success is None:
-                     logging.error("Failed to schedule task for %s via safe_after.", func.__name__)
-                     return None 
-                if not event.wait(timeout=10): 
-                    logging.error("Timeout: %s fonksiyonu ana iş parçacığında çalıştırılırken kilitlendi veya zaman aşımına uğradı. (Mevcut thread: %s, Ana thread: %s)", func.__name__, threading.get_ident(), threading.main_thread().ident)
-                    return None 
-                if error_container:
-                     logging.error("Function %s executed with error on main thread: %s", func.__name__, error_container[0])
-                     return None 
-                return result_container[0] if result_container else None
-            else:
-                logging.error("Main TK instance'ı mevcut değil: %s", func.__name__)
-                return None
+        result_container = []
+        event = threading.Event()
+        def task():
+            try:
+                result_container.append(safe_invoke(func, *args, **kwargs))
+            finally:
+                event.set()
+        if TkManager.safe_after(0, task, context=f"run_on_main_thread_global:{func.__name__}") is None:
+            return None
+        if not event.wait(timeout=10):
+            logging.error("Timeout: %s fonksiyonu ana iş parçacığında çalıştırılırken kilitlendi veya zaman aşımına uğradı. (Mevcut thread: %s, Ana thread: %s)", func.__name__, threading.get_ident(), threading.main_thread().ident)
+            return None
+        return result_container[0] if result_container else None
     return wrapper
 
 def safe_invoke(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -445,35 +337,12 @@ def safe_invoke(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 def run_on_main_thread(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any):
-        try:
-            view_instance = args[0] if args else None
-            if threading.current_thread() != threading.main_thread():
-                logging.warning("GUI fonksiyonu (%s) ana iş parçacığında çalıştırılmadı; yönlendiriliyor. (Mevcut thread: %s, Ana thread: %s)", func.__name__, threading.get_ident(), threading.main_thread().ident)
-                if view_instance is not None and hasattr(view_instance, "pencere"):
-                    if not hasattr(view_instance, "_pencere_lock") or view_instance._pencere_lock is None:
-                         setattr(view_instance, "_pencere_lock", threading.RLock())
-                    lock = view_instance._pencere_lock
-                    with lock:
-                        if view_instance.pencere is not None:
-                            TkManager.safe_after(
-                                0,
-                                lambda: safe_invoke(func, *args, **kwargs),
-                                run_in_thread=False,
-                                context=f"run_on_main_thread:{func.__name__}"
-                            )
-                        else:
-                            logging.error("Pencere nesnesi bulunamadı, GUI güncellemesi (%s) yapılamıyor.", func.__name__)
-                else:
-                    logging.error("Pencere referansı (%s) için view instance bulunamadı.", func.__name__)
-            else:
-                return safe_invoke(func, *args, **kwargs)
-        except Exception as e:
-            logging.exception("GUI callback wrapper (%s) sırasında hata: %s", func.__name__, e)
+        if threading.current_thread() is threading.main_thread():
+            return safe_invoke(func, *args, **kwargs)
+        logging.warning("GUI fonksiyonu (%s) ana iş parçacığında çalıştırılmadı; yönlendiriliyor. (Mevcut thread: %s, Ana thread: %s)", func.__name__, threading.get_ident(), threading.main_thread().ident)
+        TkManager.safe_after(0, lambda: safe_invoke(func, *args, **kwargs), context=f"run_on_main_thread:{func.__name__}")
     return wrapper
 
-# ---------------------------------------------------------------------
-# GUI Safe Wrapper Fonksiyonları
-# ---------------------------------------------------------------------
 @run_on_main_thread_global
 def safe_showinfo(title: str, message: str, *args, **kwargs):
     return messagebox.showinfo(title, message, *args, **kwargs)
@@ -483,20 +352,9 @@ def safe_showerror(title: str, message: str, *args, **kwargs):
     return messagebox.showerror(title, message, *args, **kwargs)
 
 @run_on_main_thread_global
-def safe_askretrycancel(title: str, message: str, *args, **kwargs):
-    return messagebox.askretrycancel(title, message, *args, **kwargs)
-
-@run_on_main_thread_global
 def safe_askyesno(title: str, message: str, *args, **kwargs):
     return messagebox.askyesno(title, message, *args, **kwargs)
 
-@run_on_main_thread_global
-def safe_askstring(title: str, prompt: str, *args, **kwargs) -> Optional[str]:
-    return simpledialog.askstring(title, prompt, *args, **kwargs)
-
-# ---------------------------------------------------------------------
-# Diğer Yardımcı Fonksiyonlar
-# ---------------------------------------------------------------------
 def normalize_env_var(value):
     if isinstance(value, str):
         lowered = value.lower().strip()
@@ -510,6 +368,7 @@ ALLOWED_NODES = {
     ast_mod.Expression, ast_mod.Constant,
     ast_mod.Tuple, ast_mod.List, ast_mod.Dict, ast_mod.Set,
     ast_mod.UnaryOp, ast_mod.BinOp, ast_mod.BoolOp, ast_mod.Compare,
+    ast_mod.operator, ast_mod.unaryop, ast_mod.boolop, ast_mod.cmpop,
     ast_mod.Call, ast_mod.Load, ast_mod.keyword, ast_mod.Name, ast_mod.Attribute
 }
 
@@ -568,9 +427,6 @@ def safe_eval(expr):
         code = compile(parsed, "<safe_eval>", "eval")
         return eval(code, safe_globals, {})
 
-# ---------------------------------------------------------------------
-# ÖZEL EXCEPTION SINIFLARI ve diğer yardımcı fonksiyonlar
-# ---------------------------------------------------------------------
 class APIError(Exception):
     def __init__(self, message: str, retryable: bool = True) -> None:
         super().__init__(message)
@@ -600,36 +456,22 @@ def retry_operation(
     backoff_factor: int,
     retryable_exceptions: Tuple[Type[Exception], ...] = (APIError, ConnectionError, TimeoutError)
 ) -> T:
-    last_error: Optional[Exception] = None
-    if attempts < 1:
-        attempts = 1
+    attempts = max(attempts, 1)
     for attempt in range(1, attempts + 1):
         try:
             return operation()
-        except APIError as e:
-            if not e.retryable:
+        except retryable_exceptions as e:
+            if isinstance(e, APIError) and not e.retryable:
                 logging.error("Yeniden denenemeyen API hatası: %s", e)
                 raise
-            last_error = e
             if attempt >= attempts:
-                break
-            sleep_time = min((backoff_factor ** (attempt - 1)) * random.uniform(0.5, 1.5), 10)
-            logging.warning(f"{attempt}. denemede geçici hata: {e}. {sleep_time:.2f} saniye sonra yeniden deneniyor.")
-            time.sleep(sleep_time)
-        except retryable_exceptions as e:
-            last_error = e
-            if attempt >= attempts:
-                break
+                raise
             sleep_time = min((backoff_factor ** (attempt - 1)) * random.uniform(0.5, 1.5), 10)
             logging.warning(f"{attempt}. denemede geçici hata: {e}. {sleep_time:.2f} saniye sonra yeniden deneniyor.")
             time.sleep(sleep_time)
         except Exception as e:
             logging.exception("Retry operation sırasında yeniden denenemeyen istisna oluştu: %s", e)
             raise
-    if last_error:
-        raise last_error
-    else:
-        raise RuntimeError("Bilinmeyen hata oluştu.")
 
 class SystemLocalTimezone(tzinfo):
     def utcoffset(self, dt):
@@ -709,9 +551,6 @@ def format_duration(total_seconds: float) -> str:
 def format_percentage(value: float) -> str:
     return f"{clamp_percentage(value):.1f}"
 
-# ---------------------------------------------------------------------
-# UYGULAMA SINIFLARI: ConfigManager, IftarModel, IftarController, IftarView
-# ---------------------------------------------------------------------
 class ShortFilenameFormatter(logging.Formatter):
     def __init__(self, fmt=None, datefmt=None, style='%', max_length=30):
         super().__init__(fmt, datefmt, style)
@@ -979,7 +818,6 @@ class IftarModel:
             logging.debug("Loglama sistemi zaten yapılandırıldı.")
             return
         original_stdout = sys.stdout
-        original_stderr = sys.stderr
         log_queue = queue.Queue(-1)
         from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
         queue_handler = QueueHandler(log_queue)
@@ -994,27 +832,25 @@ class IftarModel:
         file_formatter = ShortFilenameFormatter(fmt=file_format_str, datefmt="%Y-%m-%d %H:%M:%S", style='%', max_length=30)
         file_handler.setFormatter(file_formatter)
         destination_handlers = [file_handler]
-        rich_formatter = None
-        try:
-            rich_console = ModuleManager.dynamic_import("rich.console").Console(file=original_stdout or io.StringIO(), force_terminal=True, color_system="auto")
-            rich_handler = rich_logging.RichHandler(
-                level=logging.INFO,
-                show_time=False,
-                show_path=False,
-                rich_tracebacks=True,
-                console=rich_console
-            )
-            rich_format_str = "%(asctime)s - %(levelname)s - %(message)s [Line:%(lineno)d]"
-            rich_formatter = logging.Formatter(rich_format_str, datefmt="%H:%M:%S")
-            rich_handler.setFormatter(rich_formatter)
-            destination_handlers.append(rich_handler)
-        except ImportError:
-            logging.warning("Rich kütüphanesi bulunamadı veya yüklenemedi. Terminal çıktısı renksiz olacak.")
-        except Exception as e:
-            logging.error("RichHandler kurulurken hata oluştu: %s", e)
+        rich_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s [Line:%(lineno)d]", datefmt="%H:%M:%S")
+        if original_stdout is not None:
+            try:
+                rich_console = ModuleManager.dynamic_import("rich.console").Console(file=original_stdout, force_terminal=True, color_system="auto")
+                rich_handler = rich_logging.RichHandler(
+                    level=logging.INFO,
+                    show_time=False,
+                    show_path=False,
+                    rich_tracebacks=True,
+                    console=rich_console
+                )
+                rich_handler.setFormatter(rich_formatter)
+                destination_handlers.append(rich_handler)
+            except ImportError:
+                logging.warning("Rich kütüphanesi bulunamadı veya yüklenemedi. Terminal çıktısı renksiz olacak.")
+            except Exception as e:
+                logging.error("RichHandler kurulurken hata oluştu: %s", e)
         buffer_handler = LogBufferHandler(self)
-        buffer_formatter = rich_formatter if rich_formatter else file_formatter
-        buffer_handler.setFormatter(buffer_formatter)
+        buffer_handler.setFormatter(rich_formatter)
         destination_handlers.append(buffer_handler)
         self.log_queue_listener = QueueListener(log_queue, *destination_handlers)
         self.log_queue_listener.start()
@@ -1022,11 +858,7 @@ class IftarModel:
         sys.stderr = StreamToLogger(logger, logging.ERROR)
         logging.info("--- Loglama sistemi başlatıldı ---")
         logging.info("stdout artık loglama sistemine yönlendirildi.")
-        if 'sys.stderr' in locals() and isinstance(sys.stderr, StreamToLogger):
-            logging.info("stderr artık loglama sistemine yönlendirildi.")
         _LOGGING_CONFIGURED = True
-    def log_to_file(self, message: str) -> None:
-        logging.info(message)
     def set_locale(self) -> None:
         try:
             locale.setlocale(locale.LC_TIME, 'tr_TR.UTF-8')
@@ -1340,8 +1172,8 @@ class IftarModel:
             "method": self.current_method
         }
         urls = [
-            ("Mevcut ay", f"https://api.aladhan.com/v1/calendar/{year}/{month}?" + urllib_parse.urlencode(base_params))
-            for year, month in ((current_year, current_month), (next_year, next_month))
+            (label, f"https://api.aladhan.com/v1/calendar/{year}/{month}?" + urllib_parse.urlencode(base_params))
+            for label, year, month in (("Mevcut ay", current_year, current_month), ("Sonraki ay", next_year, next_month))
         ]
         data_combined = []
         for label, url in urls:
@@ -1442,23 +1274,6 @@ class IftarModel:
         except Exception as e:
             logging.exception("API'den namaz vakitleri alınamadı: %s", e)
             return ("api.aladhan.com", f"bağlantısı başarısız: {e}")
-    def run_async(self, func: Callable[..., None], *args: Any, **kwargs: Any) -> None:
-        def thread_target() -> None:
-            try:
-                func(*args, **kwargs)
-            except Exception as e:
-                error_msg = traceback.format_exc()
-                logging.exception("Asenkron fonksiyon çalıştırılırken sorun: %s", e)
-                self.log_message(f"Asenkron fonksiyon hatası:\n{error_msg}")
-        future = self.executor.submit(thread_target)
-        def callback(fut: Any) -> None:
-            try:
-                result = fut.result(timeout=5)
-            except concurrent.futures.TimeoutError as te:
-                logging.error("Asenkron görev zaman aşımına uğradı: %s", te)
-            except Exception as e:
-                logging.exception("Asenkron görev başarısız: %s", e)
-        future.add_done_callback(callback)
     def perform_request_with_retry(self, url: str, retries: Optional[int] = None, backoff_factor: Optional[int] = None, timeout: Optional[int] = None, track_failures: bool = True) -> "requests.Response":
         if retries is None:
             retries = self.DEFAULT_RETRIES
@@ -1562,10 +1377,9 @@ class LogBufferHandler(logging.Handler):
         try:
             msg = self.format(record)
             self.model.log_buffer.put(msg + "\n")
-        except Exception as e:
+        except Exception:
             self.handleError(record)
 
-# Prayer-time calculation methods used by the method picker and the prayer-time request.
 METHODS = {
     "2": "MWL (Muslim World League)",
     "4": "Egypt (Egyptian General Authority of Survey)",
@@ -1590,23 +1404,21 @@ class IftarController:
     def log_message(self, message: str) -> None:
         self.model.log_message(message)
         if self.view:
-            TkManager.safe_after(0, self.view.update_console_from_model, run_in_thread=False, context="Controller.log_message.update_console")
+            TkManager.safe_after(0, self.view.update_console_from_model, context="Controller.log_message.update_console")
     def clear_log(self) -> None:
         self.model.clear_log_file()
         if self.view:
             self.view.clear_console_panel()
-        if os.name == "nt":
-            os.system("cls")
-        else:
-            os.system("clear")
+        if sys.__stdout__ is not None:
+            os.system("cls" if os.name == "nt" else "clear")
         self.log_message("Konsol paneli ve terminal logları temizlendi.")
     def finalize_system_check(self) -> None:
-        TkManager.safe_after(0, lambda: self.view.update_sistem_saati_label("⏳", "Kontrol ediliyor..."), run_in_thread=False, context="FinalizeSystemCheck-Start")
+        TkManager.safe_after(0, lambda: self.view.update_sistem_saati_label("⏳", "Kontrol ediliyor..."), context="FinalizeSystemCheck-Start")
         def check_and_update():
             time.sleep(2)
             result_icon, result_msg = self.model.sistem_saati_kontrol_alternative()
             if self.view:
-                TkManager.safe_after(0, lambda: self.view.update_sistem_saati_label(result_icon, result_msg), run_in_thread=False, context="FinalizeSystemCheck")
+                TkManager.safe_after(0, lambda: self.view.update_sistem_saati_label(result_icon, result_msg), context="FinalizeSystemCheck")
             self.log_message(f"Sistem Saati Kontrolü: {result_icon} {result_msg}")
         threading.Thread(target=check_and_update, daemon=True).start()
     def konum_guncelle(self, notify: bool = True, resolve_text: bool = False) -> None:
@@ -1632,7 +1444,7 @@ class IftarController:
                     if not location_obj:
                         self.log_message("Kayıtlı konum çözümlenemedi; konum metni korunuyor.")
                         if notify:
-                            TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", "Kayıtlı konum çözümlenemedi. Lütfen konumu kontrol edin."), run_in_thread=False, context="SavedLocationError")
+                            TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", "Kayıtlı konum çözümlenemedi. Lütfen konumu kontrol edin."), context="SavedLocationError")
                         return
                     new_location = self.model.current_location
                     lat, lon = location_obj.latitude, location_obj.longitude
@@ -1643,7 +1455,7 @@ class IftarController:
                     return
                 if not new_location:
                     if notify:
-                        TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", "Otomatik konum alınamadı. Lütfen internet bağlantınızı kontrol edin."), run_in_thread=False, context="LocationUpdateError")
+                        TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", "Otomatik konum alınamadı. Lütfen internet bağlantınızı kontrol edin."), context="LocationUpdateError")
                     return
                 self.log_message(f"Yeni konum bulundu: {new_location}")
                 ezan_saatleri = await self.model.run_in_executor(self.model.ezan_saatlerini_hesapla, lat, lon, self.model.current_method)
@@ -1651,7 +1463,7 @@ class IftarController:
                     return
                 if not ezan_saatleri:
                     if notify:
-                        TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", "Yeni konum için ezan saatleri alınamadı; konum değiştirilmedi."), run_in_thread=False, context="LocationUpdatePrayerError")
+                        TkManager.safe_after(0, lambda: safe_showerror("Konum Hatası", "Yeni konum için ezan saatleri alınamadı; konum değiştirilmedi."), context="LocationUpdatePrayerError")
                     return
                 def calendar_worker() -> None:
                     takvim = self.model.imsakiye_takvimini_al()
@@ -1660,7 +1472,7 @@ class IftarController:
                     def apply_calendar() -> None:
                         if request_id == self._location_request_id:
                             self.view.guncelle_takvim(takvim)
-                    TkManager.safe_after(0, apply_calendar, run_in_thread=False, context="ApplyLocationCalendar")
+                    TkManager.safe_after(0, apply_calendar, context="ApplyLocationCalendar")
                 def apply_location() -> None:
                     if request_id != self._location_request_id:
                         return
@@ -1691,12 +1503,12 @@ class IftarController:
                         self.view.show_info(f"Konum Güncellendi\nYeni konum: {new_location}")
                     self.log_message(f"Konum güncellendi: {new_location}")
                     threading.Thread(target=calendar_worker, daemon=True).start()
-                TkManager.safe_after(0, apply_location, run_in_thread=False, context="ApplyLocationUpdate")
+                TkManager.safe_after(0, apply_location, context="ApplyLocationUpdate")
             except Exception as e:
                 logging.exception("Konum güncelleme sırasında hata: %s", e)
                 if notify:
                     error_message = f"Konum güncellenirken bir hata oluştu:\n{e}"
-                    TkManager.safe_after(0, lambda message=error_message: safe_showerror("Konum Hatası", message), run_in_thread=False, context="LocationUpdateException")
+                    TkManager.safe_after(0, lambda message=error_message: safe_showerror("Konum Hatası", message), context="LocationUpdateException")
         try:
             loop = self.model.async_loop
             if loop and not loop.is_closed():
@@ -1712,7 +1524,7 @@ class IftarController:
         lon = self.model.current_longitude
         def worker() -> None:
             full_location = self.model.format_active_location(lat, lon)
-            TkManager.safe_after(0, lambda: self.view.show_info(f"Aktif Konum: {full_location}"), run_in_thread=False, context="ShowCurrentLocation")
+            TkManager.safe_after(0, lambda: self.view.show_info(f"Aktif Konum: {full_location}"), context="ShowCurrentLocation")
         threading.Thread(target=worker, daemon=True).start()
     def metod_degistir(self) -> None:
         method_window = tk.Toplevel(self.view.pencere)
@@ -1749,7 +1561,7 @@ class IftarController:
                     return
                 if not ezan_saatleri:
                     self.log_message("Yeni yöntem için ezan saatleri alınamadı; yöntem değiştirilmedi.")
-                    TkManager.safe_after(0, lambda: self.view.show_error("Yöntem Hatası", "Yeni yöntem için ezan saatleri alınamadı; yöntem değiştirilmedi."), run_in_thread=False, context="MethodChangeError")
+                    TkManager.safe_after(0, lambda: self.view.show_error("Yöntem Hatası", "Yeni yöntem için ezan saatleri alınamadı; yöntem değiştirilmedi."), context="MethodChangeError")
                     return
                 def commit() -> None:
                     if request_id != self._method_request_id:
@@ -1775,9 +1587,9 @@ class IftarController:
                         def apply_calendar() -> None:
                             if request_id == self._method_request_id:
                                 self.view.guncelle_takvim(takvim)
-                        TkManager.safe_after(0, apply_calendar, run_in_thread=False, context="ApplyMethodCalendar")
+                        TkManager.safe_after(0, apply_calendar, context="ApplyMethodCalendar")
                     threading.Thread(target=calendar_worker, daemon=True).start()
-                TkManager.safe_after(0, commit, run_in_thread=False, context="MethodChanged")
+                TkManager.safe_after(0, commit, context="MethodChanged")
             threading.Thread(target=worker, daemon=True).start()
         ttk.Button(method_window, text="Uygula", command=apply_method).pack(pady=5)
         def close_window(event=None):
@@ -1833,7 +1645,6 @@ class IftarView:
         self.ConsolePanel: Optional[tk.Text] = None
         self.console_frame: Optional[ttk.Frame] = None
         self.imsak_tree: Optional[ttk.Treeview] = None
-        self.takvim_frame: Optional[ttk.Frame] = None
         self.sistem_saati_label: Optional[tk.Label] = None
         self.default_font: Optional[tkFont.Font] = None
         self.bold_font: Optional[tkFont.Font] = None
@@ -1852,9 +1663,9 @@ class IftarView:
         self._countdown_after_id: Optional[str] = None
         self._countdown_date = None
         self._daily_refresh_in_progress = False
+        self._refresh_date_headers: Optional[Callable[[], None]] = None
         self._text_context_menu: Optional[tk.Menu] = None
         self._tree_context_menu: Optional[tk.Menu] = None
-        self._last_configure_time: float = 0
         self._stored_selection: str = ""
         self.aktif_konum_frame: Optional[tk.Frame] = None
         self.current_ezan_saatleri: Dict[str, str] = {}
@@ -1891,36 +1702,19 @@ class IftarView:
             self.show_error("Ayar Hatası", "Geliştirici modu ayarı kaydedilemedi; değişiklik uygulanmadı.")
             return
         self.model.DEVELOPER_MODE = new_val
-        try:
-            global DEVELOPER_MODE
-            DEVELOPER_MODE = new_val
-        except Exception:
-            pass
-        try:
-            console_frame = self.console_frame
-            if console_frame and console_frame.winfo_exists():
-                if new_val:
-                    try:
-                        console_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
-                    except Exception:
-                        console_frame.pack(side="bottom", fill="x")
-                    try:
-                        self.update_console_from_model()
-                    except Exception:
-                        pass
-                else:
-                    console_frame.pack_forget()
-        except Exception:
-            pass
-        try:
-            if self.pencere and self.pencere.winfo_exists() and not self.pencere.attributes("-fullscreen"):
-                geom = parse_geometry(self.pencere.winfo_geometry())
-                if geom:
-                    width, _, x_offset, y_offset = geom
-                    target_h = 860 if new_val else 650
-                    self.pencere.geometry(format_geometry(width, target_h, x_offset, y_offset))
-        except Exception:
-            pass
+        global DEVELOPER_MODE
+        DEVELOPER_MODE = new_val
+        if new_val:
+            self.console_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+            self.update_console_from_model()
+        else:
+            self.console_frame.pack_forget()
+        if not self.pencere.attributes("-fullscreen"):
+            geom = parse_geometry(self.pencere.winfo_geometry())
+            if geom:
+                width, _, x_offset, y_offset = geom
+                target_h = 860 if new_val else 650
+                self.pencere.geometry(format_geometry(width, target_h, x_offset, y_offset))
         self.controller.log_message(f"Geliştirici Modu {'aktif' if new_val else 'pasif'} olarak güncellendi.")
     def store_selection(self, event: tk.Event) -> None:
         try:
@@ -1994,7 +1788,7 @@ class IftarView:
                 active_text = "Konum bilgisi yok"
             if request_id != self._location_label_request_id:
                 return
-            TkManager.safe_after(0, lambda: self._update_dynamic_entry(active_text), run_in_thread=False, context="UpdateLocationLabel")
+            TkManager.safe_after(0, lambda: self._update_dynamic_entry(active_text), context="UpdateLocationLabel")
         threading.Thread(target=heavy_task, daemon=True).start()
     def toggle_fullscreen(self, event: tk.Event = None) -> str:
         if not self.pencere.attributes("-fullscreen"):
@@ -2163,7 +1957,7 @@ class IftarView:
             if request_id != self._tooltip_request_id:
                 logging.debug("Tooltip isteği artık geçerli değil; sonuç gösterilmiyor.")
                 return
-            TkManager.safe_after(0, lambda: _display_tooltip_with_text(full_address, x_root, y_root, request_id), timeout=2, run_in_thread=False, context="DisplayTooltipAsync")
+            TkManager.safe_after(0, lambda: _display_tooltip_with_text(full_address, x_root, y_root, request_id), context="DisplayTooltipAsync")
 
         loop = self.model.async_loop
         if loop and not loop.is_closed():
@@ -2213,23 +2007,8 @@ class IftarView:
     @run_on_main_thread
     def guncelle_takvim(self, imsakiye: List[List[str]]) -> None:
         logging.info("guncelle_takvim: imsakiye verisi: %s", imsakiye)
-        if self.imsak_tree is not None:
-            for item in self.imsak_tree.get_children():
-                self.imsak_tree.delete(item)
-        else:
-            if self.takvim_frame is None or not self.takvim_frame.winfo_exists():
-                self.takvim_frame = ttk.Frame(self.pencere)
-                self.takvim_frame.pack(fill="both", expand=True)
-            columns = ("Tarih", "İmsak", "Güneş", "Öğle", "İkindi", "Akşam", "Yatsı")
-            self.imsak_tree = ttk.Treeview(self.takvim_frame, columns=columns, show="headings", selectmode="extended", height=10)
-            for col in columns:
-                if col == "Tarih":
-                    self.imsak_tree.heading(col, text=col, anchor="w")
-                    self.imsak_tree.column(col, anchor="w", width=180, stretch=False, minwidth=180)
-                else:
-                    self.imsak_tree.heading(col, text=col, anchor="center")
-                    self.imsak_tree.column(col, anchor="center", width=90, stretch=True, minwidth=60)
-            self.imsak_tree.pack(fill="both", expand=True)
+        for item in self.imsak_tree.get_children():
+            self.imsak_tree.delete(item)
         for row in imsakiye:
             self.imsak_tree.insert("", "end", values=row)
         logging.info("İmsak takvimi güncellendi.")
@@ -2238,8 +2017,6 @@ class IftarView:
         self._countdown_after_id = None
         if not after_id:
             return
-        if isinstance(after_id, str) and after_id.startswith("queued-"):
-            return
         if self.pencere and self.pencere.winfo_exists():
             try:
                 self.pencere.after_cancel(after_id)
@@ -2247,7 +2024,7 @@ class IftarView:
                 pass
     def update_countdown(self) -> None:
         if threading.current_thread() is not threading.main_thread():
-            TkManager.safe_after(0, self.update_countdown, run_in_thread=False, context="UpdateCountdown-ThreadRedirect")
+            TkManager.safe_after(0, self.update_countdown, context="UpdateCountdown-ThreadRedirect")
             return
         self._cancel_countdown_timer()
         try:
@@ -2277,6 +2054,7 @@ class IftarView:
                         self._daily_refresh_in_progress = False
                         if not (self.pencere and self.pencere.winfo_exists()):
                             return
+                        self._refresh_date_headers()
                         if ((self.model.current_latitude, self.model.current_longitude) != (refresh_lat, refresh_lon)
                                 or self.model.current_method != refresh_method):
                             logging.info("Günlük veriler hazırlanırken konum veya yöntem değişti; sonuç atlandı.")
@@ -2290,7 +2068,7 @@ class IftarView:
                             self.guncelle_takvim(takvim)
                         else:
                             logging.error("Günlük imsakiye takvimi alınamadı; önceki veriler korunuyor.")
-                    TkManager.safe_after(0, apply_daily_data, run_in_thread=False, context="DailyPrayerRefresh")
+                    TkManager.safe_after(0, apply_daily_data, context="DailyPrayerRefresh")
                 threading.Thread(target=refresh_daily_data, daemon=True).start()
             try:
                 imsak_str = self.current_ezan_saatleri.get("fajr", "06:00")
@@ -2360,9 +2138,8 @@ class IftarView:
         self.check_module_updates_var.set(current_val.lower() == "true")
         def tk_report_callback_exception(exc, val, tb):
             error_msg = "".join(traceback.format_exception(exc, val, tb))
-            logging.exception("Tkinter hatası: %s", error_msg)
+            logging.error("Tkinter hatası: %s", error_msg)
             safe_showerror("Hata", f"Beklenmeyen bir Tkinter hatası oluştu. Lütfen log dosyasını kontrol ediniz.\n\nHata Detayları:\n{error_msg}")
-            self.controller.log_message("Tkinter hatası: " + error_msg)
         self.pencere.report_callback_exception = tk_report_callback_exception
         self.pencere.withdraw()
         self.patch_messagebox_functions()
@@ -2377,7 +2154,7 @@ class IftarView:
         self.pencere.title(f"{baslik_text} - İftar Sayacı {APP_VERSION}")
         self.pencere.geometry(pencere_boyutu)
         self.pencere.update_idletasks()
-        TkManager.safe_after(100, self.controller.finalize_system_check, run_in_thread=False, context="FinalizeSystemCheck")
+        TkManager.safe_after(100, self.controller.finalize_system_check, context="FinalizeSystemCheck")
         self.pencere.bind("<F11>", self.toggle_fullscreen)
         self.pencere.bind("<Escape>", self.exit_fullscreen)
         self.pencere.minsize(650, 400)
@@ -2432,8 +2209,7 @@ class IftarView:
                 if self.pencere and self.pencere.winfo_exists():
                     baslik_label.config(text=title_text)
                     self.pencere.title(f"{title_text} - İftar Sayacı {APP_VERSION}")
-            TkManager.safe_after(0, apply_title, run_in_thread=False, context="RamadanTitle")
-        threading.Thread(target=check_ramadan_title, daemon=True).start()
+            TkManager.safe_after(0, apply_title, context="RamadanTitle")
         default_width = 330
         new_width = int(default_width * 1)
         default_height = 115
@@ -2452,13 +2228,13 @@ class IftarView:
             def apply_api_status() -> None:
                 if api_status_label.winfo_exists():
                     api_status_label.config(text=status_text)
-            TkManager.safe_after(0, apply_api_status, run_in_thread=False, context="ApiStatus")
+            TkManager.safe_after(0, apply_api_status, context="ApiStatus")
         threading.Thread(target=check_api_status, daemon=True).start()
         system_frame = ttk.Frame(center_container)
         system_frame.grid(row=1, column=0, sticky="w", padx=5, pady=2)
         self.sistem_saati_label = ttk.Label(system_frame, text="⏳ Sistem Saati Kontrolü", font=self.default_font, anchor="w", justify="left")
         self.sistem_saati_label.grid(row=0, column=0, sticky="w")
-        compare_button = self.create_logged_button(system_frame, text="🔄 Karşılaştır", command=lambda: (self.controller.log_message("Karşılaştır butonuna basıldı."), TkManager.safe_after(0, self.controller.finalize_system_check, run_in_thread=False, context="CompareSystemTime")))
+        compare_button = self.create_logged_button(system_frame, text="🔄 Karşılaştır", command=lambda: (self.controller.log_message("Karşılaştır butonuna basıldı."), TkManager.safe_after(0, self.controller.finalize_system_check, context="CompareSystemTime")))
         compare_button.grid(row=0, column=1, sticky="w", padx=(5, 0))
         aktif_konum_frame = ttk.Frame(center_container)
         aktif_konum_frame.grid(row=2, column=0, sticky="w", padx=5, pady=2)
@@ -2485,7 +2261,7 @@ class IftarView:
         def fetch_initial_times() -> None:
             ezan_saatleri = self.model.ezan_saatlerini_hesapla(enlem, boylam, requested_method)
             if not ezan_saatleri:
-                TkManager.safe_after(0, lambda: self.show_error("Bağlantı Hatası", "Ezan saatleri alınamadı. Lütfen internet bağlantınızı kontrol edin."), run_in_thread=False, context="InitialPrayerTimesError")
+                TkManager.safe_after(0, lambda: self.show_error("Bağlantı Hatası", "Ezan saatleri alınamadı. Lütfen internet bağlantınızı kontrol edin."), context="InitialPrayerTimesError")
                 return
             def apply_times() -> None:
                 if not (self.pencere and self.pencere.winfo_exists()):
@@ -2497,7 +2273,7 @@ class IftarView:
                 self.current_ezan_saatleri = ezan_saatleri
                 self.arayuzu_guncelle(ezan_saatleri)
                 self.update_countdown()
-            TkManager.safe_after(0, apply_times, run_in_thread=False, context="InitialPrayerTimes")
+            TkManager.safe_after(0, apply_times, context="InitialPrayerTimes")
         if startup_action != "resolve":
             threading.Thread(target=fetch_initial_times, daemon=True).start()
         iftar_sayaci_cerceve = ttk.Frame(self.pencere)
@@ -2527,8 +2303,12 @@ class IftarView:
         apply_hijri_header("İmsak Takvimi")
         def fetch_hijri_header() -> None:
             hicri_text = self.model.hicri_tarih_header()
-            TkManager.safe_after(0, lambda: apply_hijri_header(hicri_text), run_in_thread=False, context="HijriHeader")
-        threading.Thread(target=fetch_hijri_header, daemon=True).start()
+            TkManager.safe_after(0, lambda: apply_hijri_header(hicri_text), context="HijriHeader")
+        def refresh_date_headers() -> None:
+            threading.Thread(target=check_ramadan_title, daemon=True).start()
+            threading.Thread(target=fetch_hijri_header, daemon=True).start()
+        self._refresh_date_headers = refresh_date_headers
+        refresh_date_headers()
         imsak_takvimi_baslik.bind("<Button-3>", self.show_text_context_menu)
         imsak_takvimi_baslik.bind("<Control-c>", lambda event: self.copy_text_from_widget(imsak_takvimi_baslik))
         tablo_cerceve = ttk.Frame(self.pencere)
@@ -2549,12 +2329,11 @@ class IftarView:
         tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.imsak_tree = tree
-        self.takvim_frame = icerik_frame
         def fetch_initial_calendar() -> None:
             imsakiye = self.model.imsakiye_takvimini_al()
             if not imsakiye:
                 return
-            TkManager.safe_after(0, lambda: self.guncelle_takvim(imsakiye), run_in_thread=False, context="InitialImsakiye")
+            TkManager.safe_after(0, lambda: self.guncelle_takvim(imsakiye), context="InitialImsakiye")
         if startup_action != "resolve":
             threading.Thread(target=fetch_initial_calendar, daemon=True).start()
         tree.bind("<Button-3>", lambda event: self.show_tree_context_menu(event, tree))
@@ -2568,10 +2347,6 @@ class IftarView:
         header_frame.pack(side="top", fill="x", padx=0, pady=2)
         log_header = ttk.Label(header_frame, text="Konsol Paneli", font=self.bold_font, anchor="w")
         log_header.pack(side="left", padx=(5, 5))
-        style = ttk.Style() # Stil objesine erişim (genellikle zaten var olur)
-        if not hasattr(self, "_custom_tbutton_style_done"):
-            style.configure("Custom.TButton", font=("Segoe UI Emoji", 8))
-            self._custom_tbutton_style_done = True
         clear_button = ttk.Button(header_frame, text="Temizle", command=self.controller.clear_log, style="Custom.TButton")
         clear_button.pack(side="right", padx=(5, 8), pady=1)
         console_subframe = ttk.Frame(console_frame)
@@ -2705,22 +2480,20 @@ class IftarView:
             except Exception as e:
                 logging.error(f"{update_context} hatası: {e}")
             if self.pencere and self.pencere.winfo_exists():
-                TkManager.safe_after(500, periodic_console_update, run_in_thread=False, context=update_context)
+                TkManager.safe_after(500, periodic_console_update, context=update_context)
             else:
                  logging.debug("Periodic console update rescheduling stopped as window no longer exists.")
-        TkManager.safe_after(500, periodic_console_update, run_in_thread=False, context="InitialConsoleUpdate")
+        TkManager.safe_after(500, periodic_console_update, context="InitialConsoleUpdate")
         self.pencere.deiconify()
         if startup_action == "resolve":
-            TkManager.safe_after(300, lambda: self.controller.konum_guncelle(notify=False, resolve_text=True), run_in_thread=False, context="InitialSavedLocation")
+            TkManager.safe_after(300, lambda: self.controller.konum_guncelle(notify=False, resolve_text=True), context="InitialSavedLocation")
         elif startup_action == "auto":
-            TkManager.safe_after(300, lambda: self.controller.konum_guncelle(notify=False), run_in_thread=False, context="InitialAutoLocation")
+            TkManager.safe_after(300, lambda: self.controller.konum_guncelle(notify=False), context="InitialAutoLocation")
         self.pencere.mainloop()
     @run_on_main_thread
     def on_configure(self, event: tk.Event) -> None:
-        current_time = time.time()
-        if current_time - self._last_configure_time < 0.3:
+        if event.widget is not self.pencere:
             return
-        self._last_configure_time = current_time
         try:
             if not self.pencere.attributes("-fullscreen"):
                 self.windowed_geometry = self.pencere.geometry()
@@ -2844,19 +2617,7 @@ class IftarView:
         current_index = -1
         next_index = -1
         if today_prayers[0] is not None and now < today_prayers[0]:
-            yesterday = now_date - timedelta(days=1)
-            try:
-                last_ts = saatler[-1]
-                t_last = time_cache.get(last_ts)
-                if t_last is None:
-                    hh = int(last_ts[:2]); mm = int(last_ts[3:5])
-                    t_last = datetime(1900, 1, 1, hh, mm).time()
-                    time_cache[last_ts] = t_last
-                yesterday_yatsi = datetime.combine(yesterday, t_last, tzinfo=tz)
-            except Exception as e:
-                logging.exception("Dünün yatsı vaktinin hesaplanmasında hata: %s", e)
-                yesterday_yatsi = None
-            if yesterday_yatsi is not None:
+            if today_prayers[-1] is not None:
                 current_index = 5
                 next_index = 0
             else:
@@ -3076,14 +2837,6 @@ def graceful_shutdown(exit_process: bool = False):
             if model.executor:
                 model.executor.shutdown(wait=False, cancel_futures=True)
                 logging.info(f"{datetime.now()} - Thread havuzu kapatma isteği gönderildi.")
-                start_time = time.time()
-                while not model.executor._shutdown and time.time() - start_time < SHUTDOWN_JOIN_TIMEOUT:
-                    time.sleep(0.1)
-                if not model.executor._shutdown:
-                    logging.error("Thread havuzu kapanmadı, zorla sonlandırılıyor.")
-                    resources_closed = False
-                else:
-                    logging.info(f"{datetime.now()} - Thread havuzu başarıyla kapatıldı.")
         except Exception as e:
             logging.error(f"{datetime.now()} - Thread havuzu kapanırken hata oluştu: {e}")
             resources_closed = False
