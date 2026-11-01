@@ -9,7 +9,6 @@ import configparser
 import functools
 import importlib
 import importlib.metadata
-import importlib.util
 import json
 import logging
 import queue
@@ -24,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 import concurrent.futures
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -355,15 +354,6 @@ def safe_showerror(title: str, message: str, *args, **kwargs):
 def safe_askyesno(title: str, message: str, *args, **kwargs):
     return messagebox.askyesno(title, message, *args, **kwargs)
 
-def normalize_env_var(value):
-    if isinstance(value, str):
-        lowered = value.lower().strip()
-        if lowered in ["false", "0", "no"]:
-            return False
-        elif lowered in ["true", "1", "yes"]:
-            return True
-    return value
-
 ALLOWED_NODES = {
     ast_mod.Expression, ast_mod.Constant,
     ast_mod.Tuple, ast_mod.List, ast_mod.Dict, ast_mod.Set,
@@ -635,6 +625,8 @@ class IftarModel:
         self.BASE_DIR: str = base_dir
         self.LOG_FILE: str = os.path.join(self.BASE_DIR, "activity.log")
         self.SETTINGS_PATH: str = os.path.join(self.BASE_DIR, "settings.ini")
+        self.log_buffer: queue.Queue = queue.Queue()
+        self.setup_logging()
         self.config_manager = ConfigManager(self.SETTINGS_PATH)
         self.DEFAULT_LOCATION: str = "İzmir, Turkey"
         self.DEFAULT_LATITUDE: float = 38.4237
@@ -646,8 +638,7 @@ class IftarModel:
         self.current_method: str = ""
         self._startup_location_action: str = "none"
         self._timezone_name: Optional[str] = None
-        self.log_buffer: queue.Queue = queue.Queue()
-        self.DEVELOPER_MODE: bool = normalize_env_var(self.config_manager.get("DEVELOPER_MODE", "False"))
+        self.DEVELOPER_MODE: bool = self.config_manager.get("DEVELOPER_MODE", "False").lower() == "true"
         self.DEFAULT_TIMEOUT: int = default_timeout
         self.SHORT_TIMEOUT: int = short_timeout
         self.DEFAULT_RETRIES: int = default_retries
@@ -668,18 +659,13 @@ class IftarModel:
         self._circuit_breaker_lock = threading.Lock()
         max_workers = min(8, max(4, (os.cpu_count() or 1) * 2))
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        self.async_loop = None
-        self.async_loop_ready = threading.Event()
-        self._async_loop_starting = False
         self.start_asyncio_loop()
-        spec = importlib.util.find_spec("geopy")
-        self.geolocator = geopy.geocoders.Nominatim(user_agent=self.GEOPY_USER_AGENT) if spec else None
+        self.geolocator = geopy.geocoders.Nominatim(user_agent=self.GEOPY_USER_AGENT)
         self._geocode_cache: Dict[Tuple[float, float, str], Any] = {}
         self._geocode_cache_lock = threading.RLock()
         self._geocode_throttle_lock = threading.Lock()
         self._last_geocode_time = 0.0
         self.set_locale()
-        self.setup_logging()
         self.set_excepthook()
         self._rate_limit_interval = 0.20
         self._last_api_call = 0.0
@@ -692,126 +678,36 @@ class IftarModel:
         self._ntp_lock = threading.RLock()
         self.emojiler: List[str] = ["🌙", "🌅", "☀️", "⛅", "🌆", "🌃"]
     def start_asyncio_loop(self) -> None:
-        if self.async_loop and not self.async_loop.is_closed() and self.async_loop.is_running():
-            logging.info("Async loop zaten çalışıyor.")
-            return
-        if getattr(self, "_async_loop_starting", False):
-            logging.info("Async loop başlatma zaten devam ediyor.")
-            return
-        self._async_loop_starting = True
-        try:
-            for attempt in range(1, 4):
-                if self.async_loop is not None:
-                    self._cleanup_async_loop()
-                self.async_loop = asyncio.new_event_loop()
-                self.async_loop_ready.clear()
-                self.async_loop_thread = threading.Thread(target=self._run_loop, daemon=True)
-                self.async_loop_thread.start()
-                if self.async_loop_ready.wait(timeout=5) and self.async_loop.is_running():
-                    logging.info("Async loop başlatıldı.")
-                    return
-                logging.error("Async loop başlatılamadı (deneme %d/3).", attempt)
-                self._cleanup_async_loop()
-                time.sleep(1)
-            logging.error("Async loop üç denemede başlatılamadı; async görevler devre dışı.")
-        except Exception as e:
-            logging.exception("Async loop başlatılırken hata: %s", e)
-            self._cleanup_async_loop()
-        finally:
-            self._async_loop_starting = False
-    def _cleanup_async_loop(self):
+        self.async_loop = asyncio.new_event_loop()
+        self.async_loop_thread = threading.Thread(target=self._run_loop, args=(self.async_loop,), daemon=True)
+        self.async_loop_thread.start()
+        logging.info("Async loop başlatıldı.")
+    def _cleanup_async_loop(self) -> None:
         loop = self.async_loop
-        if loop is None:
+        if loop is None or loop.is_closed():
             return
-        current_thread = threading.current_thread()
-        loop_thread = getattr(self, "async_loop_thread", None)
-        if current_thread is loop_thread:
-            logging.info("Async loop kendi thread'inden kapatılıyor.")
-            try:
-                if not loop.is_closed():
-                    loop.stop()
-                    loop.close()
-                    logging.info("Async loop kapatıldı.")
-            except Exception as e:
-                logging.exception("Async loop kapatılırken hata: %s", e)
-            finally:
-                self.async_loop = None
-                self.async_loop_thread = None
-            return
+        async def _cancel_pending() -> None:
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await loop.shutdown_asyncgens()
         try:
-            if loop.is_closed():
-                logging.debug("Async loop zaten kapalı")
-                return
-            if loop.is_running():
-                async def _cancel_and_shutdown():
-                    current_task = asyncio.current_task()
-                    pending = [t for t in asyncio.all_tasks() if t is not current_task]
-                    if pending:
-                        logging.info("%d adet bekleyen task iptal ediliyor...", len(pending))
-                        for task in pending:
-                            task.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
-                        alive_tasks = [t for t in pending if not t.done()]
-                        if alive_tasks:
-                            logging.warning("%d task hala çalışıyor", len(alive_tasks))
-                    await loop.shutdown_asyncgens()
-                    if hasattr(loop, 'shutdown_default_executor'):
-                        await loop.shutdown_default_executor()
-                future = asyncio.run_coroutine_threadsafe(_cancel_and_shutdown(), loop)
-                try:
-                    future.result(timeout=5)
-                except concurrent.futures.TimeoutError:
-                    logging.error("Async cleanup işlemi zaman aşımına uğradı!")
-                except Exception as e:
-                    logging.exception("Async cleanup sırasında beklenmeyen hata: %s", e)
-                loop.call_soon_threadsafe(loop.stop)
-            else:
-                loop.close()
+            asyncio.run_coroutine_threadsafe(_cancel_pending(), loop).result(timeout=5)
         except Exception as e:
-            logging.exception("Async loop cleanup sırasında kritik hata: %s", e)
-        finally:
-            if loop_thread:
-                try:
-                    loop_thread.join(timeout=5)
-                    if loop_thread.is_alive():
-                        logging.warning("Async loop thread hala çalışıyor! Resource leak riski!")
-                    else:
-                        logging.info("Async loop thread sorunsuz sonlandı")
-                except Exception as e:
-                    logging.exception("Thread join hatası: %s", e)
-                finally:
-                    self.async_loop_thread = None
-            if not loop.is_closed():
-                try:
-                    loop.close()
-                    logging.info("Async loop başarıyla kapatıldı")
-                except RuntimeError as e:
-                    logging.warning("Loop zaten kapatılmış: %s", e)
-                except Exception as e:
-                    logging.exception("Loop kapatılırken bilinmeyen hata: %s", e)
-            if self.async_loop is loop:
-                self.async_loop = None
-    def _run_loop(self) -> None:
-        loop = self.async_loop
+            logging.error("Async görevleri kapatılamadı: %s", e)
+        loop.call_soon_threadsafe(loop.stop)
+        self.async_loop_thread.join(timeout=5)
+        if self.async_loop_thread.is_alive():
+            logging.warning("Async loop thread hala çalışıyor.")
+        self.async_loop = None
+    def _run_loop(self, loop: Any) -> None:
         try:
-            asyncio.set_event_loop(loop)
-            loop.call_soon(self.async_loop_ready.set)
             loop.run_forever()
-        except Exception as e:
-            logging.exception("Async loop çalışırken hata oluştu: %s", e)
         finally:
-            if loop and not loop.is_closed():
-                try:
-                    loop.close()
-                except Exception as e:
-                    logging.exception("Async loop kapatılırken hata: %s", e)
+            loop.close()
     async def run_in_executor(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
-        try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(self.executor, functools.partial(func, *args, **kwargs))
-        except Exception as e:
-            logging.exception("Executor hatası: %s", e)
-            raise
+        return await asyncio.get_running_loop().run_in_executor(self.executor, functools.partial(func, *args, **kwargs))
     def setup_logging(self) -> None:
         global _LOGGING_CONFIGURED
         if _LOGGING_CONFIGURED:
@@ -938,8 +834,6 @@ class IftarModel:
         with self._geocode_cache_lock:
             if key in self._geocode_cache:
                 return self._geocode_cache[key]
-        if not self.geolocator:
-            return None
         with self._geocode_throttle_lock:
             elapsed = time.monotonic() - self._last_geocode_time
             if elapsed < 1.0:
@@ -959,17 +853,12 @@ class IftarModel:
     def format_active_location(self, lat: Optional[float], lon: Optional[float]) -> str:
         if lat is None or lon is None:
             return "Konum bilgisi yok"
-        if not self.geolocator:
-            return f"{lat:.2f}°, {lon:.2f}° (Geopy bulunamadı)"
         location = self.reverse_geocode(lat, lon, language="en")
         if location and location.address:
             return location.address
         return f"{lat:.2f}°, {lon:.2f}°"
     def otomatik_konum_bul(self) -> tuple:
         try:
-            if not self.geolocator:
-                self.log_message("Geopy kütüphanesi yüklü değil; otomatik konum alınamıyor.")
-                return (None, None, None)
             self.log_message("Otomatik konum sorgusu başlatılıyor...")
             params = {}
             if self.IPINFO_API_KEY:
@@ -1083,39 +972,8 @@ class IftarModel:
             response = self.perform_request_with_retry(url, retries=3, timeout=self.DEFAULT_TIMEOUT)
             self.log_message(f"Hicri tarih API yanıt kodu: {response.status_code}")
             response.raise_for_status()
-            data = response.json()
-            hicri_gun = data["data"]["hijri"]["day"]
-            hicri_yil = data["data"]["hijri"]["year"]
-            try:
-                ay_no = int(data["data"]["hijri"]["month"]["number"])
-            except Exception:
-                ay_no = None
-            hicri_ay_isimleri = [
-                "Muharrem", "Safer", "Rebiülevvel", "Rebiülahir",
-                "Cemaziyelevvel", "Cemaziyelahir", "Recep", "Şaban",
-                "Ramazan", "Şevval", "Zilkade", "Zilhicce"
-            ]
-            if isinstance(ay_no, int) and 1 <= ay_no <= 12:
-                turkce_ay = hicri_ay_isimleri[ay_no - 1]
-            else:
-                hicri_ay_ing = data["data"]["hijri"]["month"]["en"].strip()
-                normalized_ay = self.remove_diacritics(hicri_ay_ing).lower()
-                ay_isimleri = {
-                    "muharram": "Muharrem",
-                    "safar": "Safer",
-                    "rabi' al-awwal": "Rebiülevvel",
-                    "rabi' al-thani": "Rebiülahir",
-                    "jumada al-awwal": "Cemaziyelevvel",
-                    "jumada al-thani": "Cemaziyelahir",
-                    "rajab": "Recep",
-                    "sha'ban": "Şaban",
-                    "ramadan": "Ramazan",
-                    "shawwal": "Şevval",
-                    "dhu al-qi'dah": "Zilkade",
-                    "dhu al-hijjah": "Zilhicce"
-                }
-                turkce_ay = ay_isimleri.get(normalized_ay, hicri_ay_ing)
-            return f"{hicri_gun} {turkce_ay} {hicri_yil} İmsak Takvimi"
+            hijri = response.json()["data"]["hijri"]
+            return f"{hijri['day']} {HICRI_AYLAR[int(hijri['month']['number']) - 1]} {hijri['year']} İmsak Takvimi"
         except Exception as e:
             if getattr(self, "DEVELOPER_MODE", False):
                 logging.exception("Hicri tarih bilgileri alınamadı: %s", e)
@@ -1123,19 +981,10 @@ class IftarModel:
                 logging.warning("Hicri tarih bilgileri alınamadı: %s", e)
             try:
                 hijri_date = hijridate.Gregorian(today.year, today.month, today.day).to_hijri()
-                hicri_gun = hijri_date.day
-                hicri_ay = hijri_date.month
-                hicri_yil = hijri_date.year
             except Exception as conv_e:
                 logging.exception("Hijri tarih hesaplanamadı: %s", conv_e)
                 return "İmsak Takvimi"
-            hicri_ay_isimleri = [
-                "Muharrem", "Safer", "Rebiülevvel", "Rebiülahir",
-                "Cemaziyelevvel", "Cemaziyelahir", "Recep", "Şaban",
-                "Ramazan", "Şevval", "Zilkade", "Zilhicce"
-            ]
-            hicri_ay_adi = hicri_ay_isimleri[hicri_ay - 1] if 1 <= hicri_ay <= 12 else str(hicri_ay)
-            return f"{hicri_gun} {hicri_ay_adi} {hicri_yil} İmsak Takvimi"
+            return f"{hijri_date.day} {HICRI_AYLAR[hijri_date.month - 1]} {hijri_date.year} İmsak Takvimi"
     def get_current_hijri_month(self) -> Optional[int]:
         today = get_utc_now().astimezone()
         date_str = today.strftime("%d-%m-%Y")
@@ -1380,6 +1229,12 @@ class LogBufferHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+HICRI_AYLAR = (
+    "Muharrem", "Safer", "Rebiülevvel", "Rebiülahir",
+    "Cemaziyelevvel", "Cemaziyelahir", "Recep", "Şaban",
+    "Ramazan", "Şevval", "Zilkade", "Zilhicce"
+)
+
 METHODS = {
     "2": "MWL (Muslim World League)",
     "4": "Egypt (Egyptian General Authority of Survey)",
@@ -1433,9 +1288,6 @@ class IftarController:
         async def task_async() -> None:
             try:
                 if resolve_text:
-                    if not self.model.geolocator:
-                        self.log_message("Kayıtlı konum çözümlenemedi; geopy kullanılamıyor.")
-                        return
                     location_obj = await self.model.run_in_executor(
                         self.model.geolocator.geocode, self.model.current_location, timeout=5
                     )
@@ -1676,6 +1528,9 @@ class IftarView:
         self.prayer_time_labels: Optional[List[tk.Widget]] = None
         self.check_module_updates_var = None
         self._last_vakit_indices = None
+        self._tp_key = None
+        self._tp_values: List[Optional[datetime]] = []
+        self._shown_vakitler = None
     def toggle_module_update_check(self) -> None:
         new_val = self.check_module_updates_var.get()
         previous_val = self.model.config_manager.get("check_module_updates", "False").lower() == "true"
@@ -1757,31 +1612,25 @@ class IftarView:
             lat = self.model.current_latitude
             lon = self.model.current_longitude
             if lat is not None and lon is not None:
-                if self.model.geolocator:
-                    try:
-                        location = self.model.reverse_geocode(lat, lon, language="en")
-                        if location:
-                            address_details = location.raw.get("address", {})
-                            city = address_details.get("city") or address_details.get("state") or ""
-                            if not city:
-                                city = (address_details.get("town") or address_details.get("village") or
-                                        address_details.get("municipality") or address_details.get("county") or "").strip()
-                            else:
-                                city = city.strip()
-                            country = address_details.get("country", "").strip()
-                            country_code = address_details.get("country_code", "")
-                        if not city and location and location.address:
-                            parts = location.address.split(",")
-                            if parts:
-                                city = parts[0].strip()
-                                country = parts[-1].strip() if len(parts) > 1 else ""
-                    except Exception as e:
-                        logging.exception("Ters geokodlama hatası: %s", e)
-                else:
-                    if self.model.current_location and "," in self.model.current_location:
-                        parts = self.model.current_location.split(",")
-                        city = parts[0].strip()
-                        country = parts[-1].strip()
+                try:
+                    location = self.model.reverse_geocode(lat, lon, language="en")
+                    if location:
+                        address_details = location.raw.get("address", {})
+                        city = address_details.get("city") or address_details.get("state") or ""
+                        if not city:
+                            city = (address_details.get("town") or address_details.get("village") or
+                                    address_details.get("municipality") or address_details.get("county") or "").strip()
+                        else:
+                            city = city.strip()
+                        country = address_details.get("country", "").strip()
+                        country_code = address_details.get("country_code", "")
+                    if not city and location and location.address:
+                        parts = location.address.split(",")
+                        if parts:
+                            city = parts[0].strip()
+                            country = parts[-1].strip() if len(parts) > 1 else ""
+                except Exception as e:
+                    logging.exception("Ters geokodlama hatası: %s", e)
                 flag = get_flag_from_alpha_2(country_code) or (get_country_flag(country) if country else "")
                 active_text = f"{city} {flag}: {lat:.2f}° , {lon:.2f}°"
             else:
@@ -2559,124 +2408,65 @@ class IftarView:
                 self.prayer_time_labels.append(lbl2)
             for i in range(6):
                 self.vakit_cerceve.columnconfigure(i, weight=1)
-        vakitler = getattr(self, "_vakitler", None)
-        if vakitler is None:
-            vakitler = ("İmsak", "Güneş", "Öğle", "İkindi", "Akşam", "Yatsı")
-            self._vakitler = vakitler
-        vakitler_ingilizce = getattr(self, "_vakitler_ing", None)
-        if vakitler_ingilizce is None:
-            vakitler_ingilizce = ("fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha")
-            self._vakitler_ing = vakitler_ingilizce
-        if not ezan_saatleri:
-            emojis = self.model.emojiler
-            for i in range(6):
-                self.prayer_labels[i].config(text=f"{vakitler[i]} ({vakitler_ingilizce[i]}) {emojis[i]}", font=self.default_font, foreground="black")
-                self.prayer_time_labels[i].config(text="N/A", font=self.default_font, foreground="black")
-            self._pl_state = [None] * 6
-            self._pl_time_state = [None] * 6
-            self._last_saatler = None
-            return
-        saatler = tuple(ezan_saatleri.get(v, "N/A") for v in vakitler_ingilizce)
-        tz_str = ezan_saatleri.get("timezone")
-        cached_tz_str = getattr(self, "_cached_tz_str", None)
-        cached_tz = getattr(self, "_cached_tz", None)
-        if cached_tz is None or cached_tz_str != tz_str:
-            tz = get_timezone_from_str(tz_str)
-            self._cached_tz = tz
-            self._cached_tz_str = tz_str
-        else:
-            tz = cached_tz
-        now = get_utc_now().astimezone(tz)
-        now_date = now.date()
-        if not hasattr(self, "_time_parse_cache"):
-            self._time_parse_cache = {}
-        time_cache = self._time_parse_cache
-        current_tp_key = (now_date, tz_str, saatler)
-        last_tp_key = getattr(self, "_tp_key", None)
-        last_tp_values = getattr(self, "_tp_values", None)
-        if last_tp_key == current_tp_key and last_tp_values is not None:
-            today_prayers = list(last_tp_values)
-        else:
-            today_prayers = []
-            append_tp = today_prayers.append
-            for i, time_str in enumerate(saatler):
-                prayer_time = None
-                try:
-                    t = time_cache.get(time_str)
-                    if t is None:
-                        hh = int(time_str[:2]); mm = int(time_str[3:5])
-                        t = datetime(1900, 1, 1, hh, mm).time()
-                        time_cache[time_str] = t
-                    prayer_time = datetime.combine(now_date, t, tzinfo=tz)
-                except Exception as e:
-                    logging.exception("Zaman dönüştürmede hata (%s): %s", vakitler[i], e)
-                    prayer_time = None
-                append_tp(prayer_time)
-            self._tp_key = current_tp_key
-            self._tp_values = tuple(today_prayers)
+        vakitler = ("İmsak", "Güneş", "Öğle", "İkindi", "Akşam", "Yatsı")
+        vakitler_ingilizce = ("fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha")
         current_index = -1
         next_index = -1
-        if today_prayers[0] is not None and now < today_prayers[0]:
-            if today_prayers[-1] is not None:
-                current_index = 5
+        if ezan_saatleri:
+            saatler = tuple(ezan_saatleri.get(v, "N/A") for v in vakitler_ingilizce)
+            tz_str = ezan_saatleri.get("timezone")
+            tz = get_timezone_from_str(tz_str)
+            now = get_utc_now().astimezone(tz)
+            tp_key = (now.date(), tz_str, saatler)
+            if self._tp_key != tp_key:
+                self._tp_values = []
+                for i, time_str in enumerate(saatler):
+                    try:
+                        t = datetime(1900, 1, 1, int(time_str[:2]), int(time_str[3:5])).time()
+                        self._tp_values.append(datetime.combine(now.date(), t, tzinfo=tz))
+                    except (TypeError, ValueError) as e:
+                        logging.exception("Zaman dönüştürmede hata (%s): %s", vakitler[i], e)
+                        self._tp_values.append(None)
+                self._tp_key = tp_key
+            today_prayers = self._tp_values
+            if today_prayers[0] is not None and now < today_prayers[0]:
+                if today_prayers[-1] is not None:
+                    current_index = 5
+                    next_index = 0
+                else:
+                    current_index = 0
+            elif today_prayers[-1] is not None and now > today_prayers[-1]:
+                current_index = len(today_prayers) - 1
                 next_index = 0
             else:
-                current_index = 0
-        elif today_prayers[-1] is not None and now > today_prayers[-1]:
-            current_index = len(today_prayers) - 1
-            next_index = 0
+                for i, prayer_time in enumerate(today_prayers):
+                    if prayer_time is None:
+                        continue
+                    if prayer_time <= now:
+                        current_index = i
+                    elif next_index == -1:
+                        next_index = i
+            pair = (current_index, next_index)
+            if self._last_vakit_indices != pair:
+                logging.info("Mevcut vakit indeksi: %s, Sonraki vakit indeksi: %s", current_index, next_index)
+                self._last_vakit_indices = pair
         else:
-            for i, prayer_time in enumerate(today_prayers):
-                if prayer_time is None:
-                    continue
-                if prayer_time <= now:
-                    current_index = i
-                elif prayer_time > now and next_index == -1:
-                    next_index = i
-        pair = (current_index, next_index)
-        if self._last_vakit_indices != pair:
-            logging.info("Mevcut vakit indeksi: %s, Sonraki vakit indeksi: %s", current_index, next_index)
-            self._last_vakit_indices = pair
-        if not hasattr(self, "_pl_state"):
-            self._pl_state = [None] * 6
-            self._pl_time_state = [None] * 6
-        labels = self.prayer_labels
-        time_labels = self.prayer_time_labels
-        default_font = self.default_font
-        bold_font = self.bold_font
-        emojis = self.model.emojiler
-        pl_state = self._pl_state
-        pl_time_state = self._pl_time_state
-        label_texts = getattr(self, "_label_texts", None)
-        emoji_snapshot = getattr(self, "_emoji_snapshot", None)
-        current_emoji_tuple = tuple(emojis)
-        if getattr(self, "_last_saatler", None) == saatler and self._last_vakit_indices == pair and emoji_snapshot == current_emoji_tuple:
+            saatler = ("N/A",) * 6
+        shown = (saatler, current_index, next_index)
+        if self._shown_vakitler == shown:
             return
-        if label_texts is None or emoji_snapshot != current_emoji_tuple:
-            label_texts = tuple(f"{vakitler[i]} ({vakitler_ingilizce[i]}) {emojis[i]}" for i in range(6))
-            self._label_texts = label_texts
-            self._emoji_snapshot = current_emoji_tuple
+        self._shown_vakitler = shown
         for i in range(6):
-            text_str = label_texts[i]
             if i == next_index:
-                fg_color = "red"
-                font_to_use = default_font
+                fg_color, font_to_use = "red", self.default_font
             elif i == current_index:
-                fg_color = "green"
-                font_to_use = bold_font
+                fg_color, font_to_use = "green", self.bold_font
             else:
-                fg_color = "black"
-                font_to_use = default_font
-            new_label_state = (text_str, font_to_use, fg_color)
-            if pl_state[i] != new_label_state:
-                labels[i].config(text=text_str, font=font_to_use, foreground=fg_color)
-                pl_state[i] = new_label_state
-            new_time_state = (saatler[i], font_to_use, fg_color)
-            if pl_time_state[i] != new_time_state:
-                time_labels[i].config(text=saatler[i], font=font_to_use, foreground=fg_color)
-                pl_time_state[i] = new_time_state
-        self._last_saatler = saatler
-        
+                fg_color, font_to_use = "black", self.default_font
+            label_text = f"{vakitler[i]} ({vakitler_ingilizce[i]}) {self.model.emojiler[i]}"
+            self.prayer_labels[i].config(text=label_text, font=font_to_use, foreground=fg_color)
+            self.prayer_time_labels[i].config(text=saatler[i], font=font_to_use, foreground=fg_color)
+
     @run_on_main_thread
     def show_info(self, msg: str) -> None:
         safe_showinfo("Bilgi", msg)

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.6]
+
+- Fixed the current prayer staying green and the next prayer staying red all day instead of moving on as each prayer time passes.
+- Fixed activity.log missing the messages written while settings.ini is read, such as a damaged file being backed up.
+- Fixed Geliştirici Modu showing the Konsol Paneli with its menu tick off when settings.ini held a value other than True or False.
+- Removed unreachable code, a duplicated list of Hijri month names, and extra background task handling.
+
 ## [1.0.5]
 
 - Fixed the window sometimes reopening a little away from where you last moved it.
