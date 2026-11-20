@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.7]
+
+- Fixed prayer times and the imsak calendar staying on the previous day when the internet was down at midnight or when the computer woke up.
+- Removed a duplicated error message wrapper and two names the Geliştirici Modu command line could never use.
+
 ## [1.0.6]
 
 - Fixed the current prayer staying green and the next prayer staying red all day instead of moving on as each prayer time passes.

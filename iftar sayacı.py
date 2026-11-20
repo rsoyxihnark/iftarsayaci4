@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 import concurrent.futures
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -369,11 +369,9 @@ ALLOWED_FUNCTIONS = {
     'len': len,
     'max': max,
     'min': min,
-    'messagebox.showinfo': safe_showinfo,
     'print': print,
     'str': str,
     'sum': sum,
-    'tkMessageBox.showinfo': safe_showinfo,
 }
 
 def test_function():
@@ -1886,7 +1884,6 @@ class IftarView:
             if self._countdown_date is None:
                 self._countdown_date = local_date
             elif self._countdown_date != local_date and not self._daily_refresh_in_progress:
-                self._countdown_date = local_date
                 self._daily_refresh_in_progress = True
                 refresh_lat = self.model.current_latitude
                 refresh_lon = self.model.current_longitude
@@ -1909,15 +1906,16 @@ class IftarView:
                             logging.info("Günlük veriler hazırlanırken konum veya yöntem değişti; sonuç atlandı.")
                             return
                         if ezan_saatleri:
+                            self._countdown_date = local_date
                             self.current_ezan_saatleri = ezan_saatleri
                             self.arayuzu_guncelle(ezan_saatleri)
                         else:
-                            logging.error("Günlük ezan saatleri alınamadı; önceki veriler korunuyor.")
+                            logging.error("Günlük ezan saatleri alınamadı; bir dakika sonra yeniden denenecek.")
                         if takvim:
                             self.guncelle_takvim(takvim)
                         else:
                             logging.error("Günlük imsakiye takvimi alınamadı; önceki veriler korunuyor.")
-                    TkManager.safe_after(0, apply_daily_data, context="DailyPrayerRefresh")
+                    TkManager.safe_after(0 if ezan_saatleri else 60000, apply_daily_data, context="DailyPrayerRefresh")
                 threading.Thread(target=refresh_daily_data, daemon=True).start()
             try:
                 imsak_str = self.current_ezan_saatleri.get("fajr", "06:00")
@@ -2360,21 +2358,11 @@ class IftarView:
                     message = message[:max_length] + "..."
                 return original_function(title, message, *args, **kwargs)
             return wrapper
-        functions = ["showinfo", "showwarning", "askquestion", "askokcancel", "askyesno", "askretrycancel"]
+        functions = ["showinfo", "showwarning", "showerror", "askquestion", "askokcancel", "askyesno", "askretrycancel"]
         for func_name in functions:
             original_func = getattr(messagebox, func_name)
             limited_func = _limited_messagebox_wrapper(original_func, max_length=1024)
             setattr(messagebox, func_name, limited_func)
-        _original_showerror = messagebox.showerror
-        def limited_showerror(title: str, message: str, *args: Any, **kwargs: Any):
-            if threading.current_thread() is not threading.main_thread():
-                logging.error("GUI messagebox.showerror ana iş parçacığı dışında çağrıldı.")
-                return None
-            MAX_LENGTH = 1024
-            if len(message) > MAX_LENGTH:
-                message = message[:MAX_LENGTH] + "..."
-            return _original_showerror(title, message, *args, **kwargs)
-        messagebox.showerror = limited_showerror
         messagebox._iftar_messagebox_patched = True
     def get_window_geometry(self) -> str:
         saved_geom = self.model.config_manager.get("pencere_boyutu", "")
