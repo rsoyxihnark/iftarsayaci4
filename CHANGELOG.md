@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.8]
+
+- Fixed prayer times and the imsak calendar never loading when the app was opened before the internet was available.
+- After opening the app offline, the Hijri date, the Ramadan greeting, Aktif Konum and Uygulama Sağlığı now update once the internet is back.
+- Fixed a new install staying on İzmir instead of finding your location automatically on first start.
+- Fixed the packaged app reading its .env file from the folder it was started in instead of from beside the program.
+- Fixed the IPINFO_API_KEY value showing up in activity.log when finding your location failed.
+- Fixed activity.log repeating the same connection warning for every failed request while the internet is down.
+- Removed the hiding of keys in logged web addresses, as no web address the app uses carries a key any more.
+
 ## [1.0.7]
 
 - Fixed prayer times and the imsak calendar staying on the previous day when the internet was down at midnight or when the computer woke up.

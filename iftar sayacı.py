@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 import concurrent.futures
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -242,7 +242,7 @@ unicodedata = ModuleManager.dynamic_import("unicodedata")
 urllib_parse = ModuleManager.dynamic_import("urllib.parse")
 zoneinfo = ModuleManager.dynamic_import("zoneinfo")
 dotenv = ModuleManager.dynamic_import("dotenv")
-dotenv.load_dotenv()
+dotenv.load_dotenv(os.path.join(get_base_dir(), ".env"))
 
 class TkManager:
     main_instance: Optional[tk.Tk] = None
@@ -423,21 +423,6 @@ class APIError(Exception):
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
-SENSITIVE_URL_PARAMS = {"token", "key", "api_key", "apikey", "access_token"}
-
-def redact_url(url: str) -> str:
-    try:
-        parts = urllib_parse.urlsplit(url)
-        if not parts.query:
-            return url
-        query = [
-            (key, "***" if key.lower() in SENSITIVE_URL_PARAMS else value)
-            for key, value in urllib_parse.parse_qsl(parts.query, keep_blank_values=True)
-        ]
-        return urllib_parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib_parse.urlencode(query), parts.fragment))
-    except Exception:
-        return url
-
 def retry_operation(
     operation: Callable[[], T],
     attempts: int,
@@ -555,7 +540,6 @@ class ShortFilenameFormatter(logging.Formatter):
 
 class ConfigManager:
     DEFAULT_SETTINGS = {
-        "konum": "İzmir, Turkey",
         "metod": "13",
         "check_module_updates": "False",
         "DEVELOPER_MODE": "False"
@@ -858,11 +842,8 @@ class IftarModel:
     def otomatik_konum_bul(self) -> tuple:
         try:
             self.log_message("Otomatik konum sorgusu başlatılıyor...")
-            params = {}
-            if self.IPINFO_API_KEY:
-                params["token"] = self.IPINFO_API_KEY
-            url = "https://ipinfo.io/json" + (("?" + urllib_parse.urlencode(params)) if params else "")
-            response = self.perform_request_with_retry(url, retries=3, timeout=self.SHORT_TIMEOUT)
+            headers = {"Authorization": f"Bearer {self.IPINFO_API_KEY}"} if self.IPINFO_API_KEY else None
+            response = self.perform_request_with_retry("https://ipinfo.io/json", retries=3, timeout=self.SHORT_TIMEOUT, headers=headers)
             self.log_message(f"ipinfo.io yanıt kodu: {response.status_code}")
             if response.status_code == 200:
                 data = response.json()
@@ -1121,7 +1102,7 @@ class IftarModel:
         except Exception as e:
             logging.exception("API'den namaz vakitleri alınamadı: %s", e)
             return ("api.aladhan.com", f"bağlantısı başarısız: {e}")
-    def perform_request_with_retry(self, url: str, retries: Optional[int] = None, backoff_factor: Optional[int] = None, timeout: Optional[int] = None, track_failures: bool = True) -> "requests.Response":
+    def perform_request_with_retry(self, url: str, retries: Optional[int] = None, backoff_factor: Optional[int] = None, timeout: Optional[int] = None, track_failures: bool = True, headers: Optional[Dict[str, str]] = None) -> "requests.Response":
         if retries is None:
             retries = self.DEFAULT_RETRIES
         if backoff_factor is None:
@@ -1147,7 +1128,7 @@ class IftarModel:
                     time.sleep(self._rate_limit_interval - time_since_last)
                 self._last_api_call = time.monotonic()
             try:
-                response = self.GLOBAL_SESSION.get(url, timeout=timeout, verify=self._ca_bundle)
+                response = self.GLOBAL_SESSION.get(url, headers=headers, timeout=timeout, verify=self._ca_bundle)
                 response.raise_for_status()
             except requests.RequestException as e:
                 status_code = e.response.status_code if isinstance(e, requests.HTTPError) and e.response is not None else None
@@ -1155,7 +1136,7 @@ class IftarModel:
                 if track_failures and not client_error:
                     with self._circuit_breaker_lock:
                         self._failure_count += 1
-                        if self._failure_count >= self._failure_threshold:
+                        if self._failure_count >= self._failure_threshold and self._circuit_breaker_state != "open":
                             self._circuit_breaker_state = "open"
                             self._circuit_breaker_open_until = time.monotonic() + self._circuit_breaker_reset_timeout
                             logging.warning(
@@ -1207,13 +1188,12 @@ class IftarModel:
                     self._circuit_breaker_state = "closed"
                     self._circuit_breaker_open_until = 0.0
             return response
-        safe_url = redact_url(url)
         try:
             result = retry_operation(operation, retries, backoff_factor)
-            self.log_message(f"{safe_url} adresine yapılan istek başarılı. Durum: {result.status_code}")
+            self.log_message(f"{url} adresine yapılan istek başarılı. Durum: {result.status_code}")
             return result
         except APIError as e:
-            logging.error("Hata: %s adresine yapılan istek %d denemede başarısız oldu: %s", safe_url, retries, e)
+            logging.error("Hata: %s adresine yapılan istek %d denemede başarısız oldu: %s", url, retries, e)
             raise
 
 class LogBufferHandler(logging.Handler):
@@ -2105,10 +2085,11 @@ class IftarView:
         self.current_ezan_saatleri = {}
         self.arayuzu_guncelle({})
         requested_method = self.model.current_method
-        def fetch_initial_times() -> None:
+        def fetch_initial_times(show_error: bool = True) -> None:
             ezan_saatleri = self.model.ezan_saatlerini_hesapla(enlem, boylam, requested_method)
             if not ezan_saatleri:
-                TkManager.safe_after(0, lambda: self.show_error("Bağlantı Hatası", "Ezan saatleri alınamadı. Lütfen internet bağlantınızı kontrol edin."), context="InitialPrayerTimesError")
+                if show_error:
+                    TkManager.safe_after(0, lambda: self.show_error("Bağlantı Hatası", "Ezan saatleri alınamadı. Lütfen internet bağlantınızı kontrol edin."), context="InitialPrayerTimesError")
                 return
             def apply_times() -> None:
                 if not (self.pencere and self.pencere.winfo_exists()):
@@ -2331,6 +2312,30 @@ class IftarView:
             else:
                  logging.debug("Periodic console update rescheduling stopped as window no longer exists.")
         TkManager.safe_after(500, periodic_console_update, context="InitialConsoleUpdate")
+        def retry_startup_load(retried: bool = False) -> None:
+            if not (self.pencere and self.pencere.winfo_exists()):
+                return
+            times_missing = not self.current_ezan_saatleri
+            calendar_missing = not self.imsak_tree.get_children()
+            if not (times_missing or calendar_missing):
+                if retried:
+                    if startup_action == "auto" and self.model.current_location == self.model.DEFAULT_LOCATION:
+                        self.controller.konum_guncelle(notify=False)
+                    self._refresh_date_headers()
+                    self.Aktif_Konum_Labeli_uygulama_sagligi_icinde_widget_V2()
+                    threading.Thread(target=check_api_status, daemon=True).start()
+                    self.controller.finalize_system_check()
+                return
+            self.controller.log_message("Açılış verileri eksik; yeniden deneniyor.")
+            if self.model.current_latitude is None:
+                self.controller.konum_guncelle(notify=False, resolve_text=True)
+            else:
+                if times_missing:
+                    threading.Thread(target=fetch_initial_times, args=(False,), daemon=True).start()
+                if calendar_missing:
+                    threading.Thread(target=fetch_initial_calendar, daemon=True).start()
+            TkManager.safe_after(60000, retry_startup_load, True, context="StartupRetry")
+        TkManager.safe_after(60000, retry_startup_load, context="StartupRetry")
         self.pencere.deiconify()
         if startup_action == "resolve":
             TkManager.safe_after(300, lambda: self.controller.konum_guncelle(notify=False, resolve_text=True), context="InitialSavedLocation")
