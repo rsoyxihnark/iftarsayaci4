@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 import concurrent.futures
 
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -906,15 +906,6 @@ class IftarModel:
                     self._ezan_cache.pop(next(iter(self._ezan_cache)))
                 self._ezan_cache[cache_key] = dict(timings)
             return timings
-        except requests.exceptions.ConnectionError as e:
-            logging.error("Bağlantı hatası: %s", e)
-            return None
-        except requests.exceptions.Timeout as e:
-            logging.error("Zaman aşımı hatası: %s", e)
-            return None
-        except requests.exceptions.RequestException as e:
-            logging.exception("Ezan saatleri alınamadı: %s", e)
-            return None
         except APIError as e:
             logging.error("API hatası: %s", e)
             return None
@@ -1610,7 +1601,9 @@ class IftarView:
                 except Exception as e:
                     logging.exception("Ters geokodlama hatası: %s", e)
                 flag = get_flag_from_alpha_2(country_code) or (get_country_flag(country) if country else "")
-                active_text = f"{city} {flag}: {lat:.2f}° , {lon:.2f}°"
+                place = f"{city} {flag}".strip()
+                coords = f"{lat:.2f}° , {lon:.2f}°"
+                active_text = f"{place}: {coords}" if place else coords
             else:
                 active_text = "Konum bilgisi yok"
             if request_id != self._location_label_request_id:
@@ -2051,7 +2044,8 @@ class IftarView:
         def check_api_status() -> None:
             domain, ping_ms = self.model.api_canlılık_durumu()
             api_emoji = "✅" if isinstance(ping_ms, int) and ping_ms < 500 else "❌"
-            status_text = f"{api_emoji} API Durumu ({domain}): {ping_ms} ms"
+            ping_text = f"{ping_ms} ms" if isinstance(ping_ms, int) else ping_ms
+            status_text = f"{api_emoji} API Durumu ({domain}): {ping_text}"
             def apply_api_status() -> None:
                 if api_status_label.winfo_exists():
                     api_status_label.config(text=status_text)
@@ -2066,7 +2060,7 @@ class IftarView:
         aktif_konum_frame = ttk.Frame(center_container)
         aktif_konum_frame.grid(row=2, column=0, sticky="w", padx=5, pady=2)
         self.aktif_konum_frame = aktif_konum_frame
-        static_label = ttk.Label(aktif_konum_frame, text=self.static_prefix if self.model.current_location else "❌ Konum alınamadı.", font=self.default_font, anchor="w", justify="left")
+        static_label = ttk.Label(aktif_konum_frame, text=self.static_prefix, font=self.default_font, anchor="w", justify="left")
         static_label.grid(row=0, column=0, sticky="w")
         self.dynamic_entry = tk.Entry(aktif_konum_frame, width=29, font=self.default_font, bd=0, relief="flat", exportselection=1)
         self.dynamic_entry.grid(row=0, column=1, sticky="w", padx=(2,0))

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.9]
+
+- Fixed API Durumu in Uygulama Sağlığı showing ms after the error message when the check failed.
+- Fixed Aktif Konum showing a stray colon before the coordinates when the place name could not be found.
+- Removed unreachable code from the prayer time request and the Aktif Konum label.
+
 ## [1.0.8]
 
 - Fixed prayer times and the imsak calendar never loading when the app was opened before the internet was available.
